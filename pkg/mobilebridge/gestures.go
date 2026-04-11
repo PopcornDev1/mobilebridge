@@ -1,6 +1,7 @@
 package mobilebridge
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -63,37 +64,65 @@ func validCoord(x, y int) error {
 	return nil
 }
 
+// sender returns the messageSender backing this Proxy. Defaults to the Proxy
+// itself; tests override via direct assignment to p.senderOverride (allowed
+// because messageSender is unexported).
+func (p *Proxy) sender() messageSender {
+	if p.senderOverride != nil {
+		return p.senderOverride
+	}
+	return p
+}
+
 // Tap sends a single-finger touchStart then touchEnd at (x, y).
-func Tap(p messageSender, x, y int) error {
+func (p *Proxy) Tap(ctx context.Context, x, y int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := validCoord(x, y); err != nil {
 		return err
 	}
+	s := p.sender()
 	points := []TouchPoint{{X: float64(x), Y: float64(y), ID: 0, Force: 1}}
-	if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", points)); err != nil {
+	if err := s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", points)); err != nil {
 		return err
 	}
-	return p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
+	return s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
 }
 
 // LongPress sends a touchStart, waits durationMs, then sends a touchEnd.
-func LongPress(p messageSender, x, y, durationMs int) error {
+// The wait honors ctx cancellation.
+func (p *Proxy) LongPress(ctx context.Context, x, y, durationMs int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := validCoord(x, y); err != nil {
 		return err
 	}
 	if durationMs <= 0 {
 		return fmt.Errorf("mobilebridge: long press duration must be > 0, got %d", durationMs)
 	}
+	s := p.sender()
 	points := []TouchPoint{{X: float64(x), Y: float64(y), ID: 0, Force: 1}}
-	if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", points)); err != nil {
+	if err := s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", points)); err != nil {
 		return err
 	}
-	time.Sleep(time.Duration(durationMs) * time.Millisecond)
-	return p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
+	select {
+	case <-time.After(time.Duration(durationMs) * time.Millisecond):
+	case <-ctx.Done():
+		// Best-effort touchEnd so we don't leave a dangling touchStart.
+		_ = s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
+		return ctx.Err()
+	}
+	return s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
 }
 
 // Swipe performs a single-finger drag from (fromX, fromY) to (toX, toY) over
 // durationMs milliseconds, interpolating with a fixed number of move events.
-func Swipe(p messageSender, fromX, fromY, toX, toY, durationMs int) error {
+func (p *Proxy) Swipe(ctx context.Context, fromX, fromY, toX, toY, durationMs int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	const steps = 10
 	if err := validCoord(fromX, fromY); err != nil {
 		return err
@@ -104,8 +133,9 @@ func Swipe(p messageSender, fromX, fromY, toX, toY, durationMs int) error {
 	if durationMs < 0 {
 		durationMs = 0
 	}
+	s := p.sender()
 	start := []TouchPoint{{X: float64(fromX), Y: float64(fromY), ID: 0, Force: 1}}
-	if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", start)); err != nil {
+	if err := s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", start)); err != nil {
 		return err
 	}
 	stepSleep := time.Duration(durationMs) * time.Millisecond / time.Duration(steps+1)
@@ -114,23 +144,31 @@ func Swipe(p messageSender, fromX, fromY, toX, toY, durationMs int) error {
 		x := float64(fromX) + (float64(toX-fromX) * frac)
 		y := float64(fromY) + (float64(toY-fromY) * frac)
 		move := []TouchPoint{{X: x, Y: y, ID: 0, Force: 1}}
-		if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchMove", move)); err != nil {
+		if err := s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchMove", move)); err != nil {
 			return err
 		}
 		if stepSleep > 0 {
-			time.Sleep(stepSleep)
+			select {
+			case <-time.After(stepSleep):
+			case <-ctx.Done():
+				_ = s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
+				return ctx.Err()
+			}
 		}
 	}
 	end := []TouchPoint{{X: float64(toX), Y: float64(toY), ID: 0, Force: 1}}
-	if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchMove", end)); err != nil {
+	if err := s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchMove", end)); err != nil {
 		return err
 	}
-	return p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
+	return s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
 }
 
 // Pinch performs a two-finger pinch centered at (centerX, centerY). A scale
 // greater than 1 zooms in (fingers move apart); less than 1 zooms out.
-func Pinch(p messageSender, centerX, centerY int, scale float64) error {
+func (p *Proxy) Pinch(ctx context.Context, centerX, centerY int, scale float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if scale <= 0 {
 		return fmt.Errorf("mobilebridge: pinch scale must be > 0, got %v", scale)
 	}
@@ -141,23 +179,28 @@ func Pinch(p messageSender, centerX, centerY int, scale float64) error {
 	startOffset := baseOffset
 	endOffset := baseOffset * scale
 
+	s := p.sender()
 	startA := TouchPoint{X: float64(centerX) - startOffset, Y: float64(centerY), ID: 0, Force: 1}
 	startB := TouchPoint{X: float64(centerX) + startOffset, Y: float64(centerY), ID: 1, Force: 1}
 
-	if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", []TouchPoint{startA, startB})); err != nil {
+	if err := s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", []TouchPoint{startA, startB})); err != nil {
 		return err
 	}
 
 	for i := 1; i <= steps; i++ {
+		if err := ctx.Err(); err != nil {
+			_ = s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
+			return err
+		}
 		frac := float64(i) / float64(steps)
 		off := startOffset + (endOffset-startOffset)*frac
 		a := TouchPoint{X: float64(centerX) - off, Y: float64(centerY), ID: 0, Force: 1}
 		b := TouchPoint{X: float64(centerX) + off, Y: float64(centerY), ID: 1, Force: 1}
-		if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchMove", []TouchPoint{a, b})); err != nil {
+		if err := s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchMove", []TouchPoint{a, b})); err != nil {
 			return err
 		}
 	}
-	return p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
+	return s.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchEnd", nil))
 }
 
 // round is an internal helper for tests.

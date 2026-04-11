@@ -1,9 +1,16 @@
 package mobilebridge
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 )
+
+// proxyWithSender builds a minimal Proxy wired to a fake messageSender so
+// gesture tests can drive the method receivers without a real WebSocket.
+func proxyWithSender(s messageSender) *Proxy {
+	return &Proxy{senderOverride: s}
+}
 
 // fakeSender captures every message a gesture helper produces.
 type fakeSender struct {
@@ -33,7 +40,8 @@ func (f *fakeSender) sendUpstream(method string, params any) error {
 
 func TestTapProducesStartEnd(t *testing.T) {
 	f := &fakeSender{}
-	if err := Tap(f, 100, 200); err != nil {
+	p := proxyWithSender(f)
+	if err := p.Tap(context.Background(), 100, 200); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.msgs) != 2 {
@@ -59,7 +67,8 @@ func TestTapProducesStartEnd(t *testing.T) {
 
 func TestLongPress(t *testing.T) {
 	f := &fakeSender{}
-	if err := LongPress(f, 10, 20, 1); err != nil {
+	p := proxyWithSender(f)
+	if err := p.LongPress(context.Background(), 10, 20, 1); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.msgs) != 2 || f.msgs[0].Type != "touchStart" || f.msgs[1].Type != "touchEnd" {
@@ -69,7 +78,8 @@ func TestLongPress(t *testing.T) {
 
 func TestSwipeSequence(t *testing.T) {
 	f := &fakeSender{}
-	if err := Swipe(f, 0, 0, 100, 200, 0); err != nil {
+	p := proxyWithSender(f)
+	if err := p.Swipe(context.Background(), 0, 0, 100, 200, 0); err != nil {
 		t.Fatal(err)
 	}
 	// Expect: touchStart + 10 moves + final move + touchEnd = 13 events.
@@ -107,7 +117,8 @@ func TestSwipeSequence(t *testing.T) {
 
 func TestPinchTwoFingers(t *testing.T) {
 	f := &fakeSender{}
-	if err := Pinch(f, 500, 500, 0.5); err != nil {
+	p := proxyWithSender(f)
+	if err := p.Pinch(context.Background(), 500, 500, 0.5); err != nil {
 		t.Fatal(err)
 	}
 	// touchStart + 10 moves + touchEnd = 12
@@ -144,7 +155,8 @@ func TestPinchTwoFingers(t *testing.T) {
 
 func TestPinchOutExpands(t *testing.T) {
 	f := &fakeSender{}
-	if err := Pinch(f, 500, 500, 2.0); err != nil {
+	p := proxyWithSender(f)
+	if err := p.Pinch(context.Background(), 500, 500, 2.0); err != nil {
 		t.Fatal(err)
 	}
 	start := f.msgs[0]
@@ -158,6 +170,7 @@ func TestPinchOutExpands(t *testing.T) {
 
 func TestSwipe_BoundsValidation(t *testing.T) {
 	f := &fakeSender{}
+	p := proxyWithSender(f)
 	cases := [][5]int{
 		{-1, 0, 10, 10, 0},
 		{0, -1, 10, 10, 0},
@@ -167,7 +180,7 @@ func TestSwipe_BoundsValidation(t *testing.T) {
 		{0, 0, maxCoord + 1, 10, 0},
 	}
 	for _, c := range cases {
-		if err := Swipe(f, c[0], c[1], c[2], c[3], c[4]); err == nil {
+		if err := p.Swipe(context.Background(), c[0], c[1], c[2], c[3], c[4]); err == nil {
 			t.Errorf("expected error for %v", c)
 		}
 	}
@@ -178,7 +191,8 @@ func TestSwipe_BoundsValidation(t *testing.T) {
 
 func TestPinch_ScaleZero(t *testing.T) {
 	f := &fakeSender{}
-	if err := Pinch(f, 500, 500, 0); err == nil {
+	p := proxyWithSender(f)
+	if err := p.Pinch(context.Background(), 500, 500, 0); err == nil {
 		t.Error("expected error for scale=0")
 	}
 	if len(f.msgs) != 0 {
@@ -188,10 +202,11 @@ func TestPinch_ScaleZero(t *testing.T) {
 
 func TestLongPress_NegativeDuration(t *testing.T) {
 	f := &fakeSender{}
-	if err := LongPress(f, 100, 100, -1); err == nil {
+	p := proxyWithSender(f)
+	if err := p.LongPress(context.Background(), 100, 100, -1); err == nil {
 		t.Error("expected error for negative duration")
 	}
-	if err := LongPress(f, 100, 100, 0); err == nil {
+	if err := p.LongPress(context.Background(), 100, 100, 0); err == nil {
 		t.Error("expected error for zero duration")
 	}
 	if len(f.msgs) != 0 {
@@ -201,7 +216,8 @@ func TestLongPress_NegativeDuration(t *testing.T) {
 
 func TestTap_BasicEventSequence(t *testing.T) {
 	f := &fakeSender{}
-	if err := Tap(f, 42, 84); err != nil {
+	p := proxyWithSender(f)
+	if err := p.Tap(context.Background(), 42, 84); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.msgs) != 2 {
@@ -227,10 +243,11 @@ func TestTap_BasicEventSequence(t *testing.T) {
 
 func TestPinchRejectsBadScale(t *testing.T) {
 	f := &fakeSender{}
-	if err := Pinch(f, 0, 0, 0); err == nil {
+	p := proxyWithSender(f)
+	if err := p.Pinch(context.Background(), 0, 0, 0); err == nil {
 		t.Error("expected error for scale=0")
 	}
-	if err := Pinch(f, 0, 0, -1); err == nil {
+	if err := p.Pinch(context.Background(), 0, 0, -1); err == nil {
 		t.Error("expected error for negative scale")
 	}
 }

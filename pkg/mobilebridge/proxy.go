@@ -2,6 +2,7 @@ package mobilebridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,12 @@ type Proxy struct {
 	methodMu       sync.RWMutex
 	methodHandlers map[string]func(params json.RawMessage) (interface{}, error)
 
+	// senderOverride, if non-nil, replaces p itself as the messageSender
+	// used by gesture methods. Tests use this to inject a fake sender;
+	// production code leaves it nil. The field is unexported so only
+	// same-package tests can set it.
+	senderOverride messageSender
+
 	closeOnce sync.Once
 	closed    chan struct{}
 }
@@ -143,6 +150,10 @@ func (p *Proxy) lookupMethod(name string) (func(params json.RawMessage) (interfa
 // methods into methodHandlers. Called from NewProxy and also from tests that
 // construct a bare Proxy{}.
 func (p *Proxy) registerDefaultMethodHandlers() {
+	// Synthetic method handlers use a background context because they run
+	// off the downstream read goroutine and have no ambient request ctx.
+	// Long-running gestures (LongPress) will still return promptly because
+	// durations are caller-provided in ms.
 	p.RegisterMethod("MobileBridge.tap", func(params json.RawMessage) (interface{}, error) {
 		var args struct{ X, Y int }
 		if len(params) > 0 {
@@ -150,7 +161,7 @@ func (p *Proxy) registerDefaultMethodHandlers() {
 				return nil, err
 			}
 		}
-		if err := Tap(p, args.X, args.Y); err != nil {
+		if err := p.Tap(context.Background(), args.X, args.Y); err != nil {
 			return nil, err
 		}
 		return map[string]interface{}{}, nil
@@ -164,7 +175,7 @@ func (p *Proxy) registerDefaultMethodHandlers() {
 				return nil, err
 			}
 		}
-		if err := LongPress(p, args.X, args.Y, args.DurationMs); err != nil {
+		if err := p.LongPress(context.Background(), args.X, args.Y, args.DurationMs); err != nil {
 			return nil, err
 		}
 		return map[string]interface{}{}, nil
@@ -178,7 +189,7 @@ func (p *Proxy) registerDefaultMethodHandlers() {
 				return nil, err
 			}
 		}
-		if err := Swipe(p, args.FromX, args.FromY, args.ToX, args.ToY, args.DurationMs); err != nil {
+		if err := p.Swipe(context.Background(), args.FromX, args.FromY, args.ToX, args.ToY, args.DurationMs); err != nil {
 			return nil, err
 		}
 		return map[string]interface{}{}, nil
@@ -193,7 +204,7 @@ func (p *Proxy) registerDefaultMethodHandlers() {
 				return nil, err
 			}
 		}
-		if err := Pinch(p, args.CenterX, args.CenterY, args.Scale); err != nil {
+		if err := p.Pinch(context.Background(), args.CenterX, args.CenterY, args.Scale); err != nil {
 			return nil, err
 		}
 		return map[string]interface{}{}, nil
