@@ -202,22 +202,22 @@ func (s *Server) RunWithProxy(p *Proxy) error {
 	// WebSocket: accept a downstream client, then hand to proxy.Serve. Note
 	// that each inbound websocket consumes the single upstream owned by the
 	// proxy; concurrent clients are not supported in this MVP.
-	mux.HandleFunc("/devtools/page/", func(w http.ResponseWriter, r *http.Request) {
+	wsHandler := func(w http.ResponseWriter, r *http.Request) {
+		if p.Busy() {
+			http.Error(w, "mobilebridge: another client is already attached (single-client MVP)", http.StatusServiceUnavailable)
+			return
+		}
 		ws, err := s.upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer ws.Close()
-		_ = p.Serve(ws)
-	})
-	mux.HandleFunc("/devtools/browser", func(w http.ResponseWriter, r *http.Request) {
-		ws, err := s.upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
+		if err := p.Serve(ws); err != nil && errors.Is(err, ErrBusy) {
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"error":"mobilebridge busy"}`))
 		}
-		defer ws.Close()
-		_ = p.Serve(ws)
-	})
+	}
+	mux.HandleFunc("/devtools/page/", wsHandler)
+	mux.HandleFunc("/devtools/browser", wsHandler)
 
 	srv.Handler = mux
 	return nil

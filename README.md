@@ -95,6 +95,21 @@ Each helper builds the correct sequence of `Input.dispatchTouchEvent` payloads (
 - **Stateless per connection.** The proxy keeps one upstream WebSocket to Chrome and pumps frames bidirectionally. Closing the client closes the upstream and tears down the forward.
 - **Hotplug.** `WatchDevices` polls `adb devices` so tools built on top can react to devices appearing and disappearing.
 
+## Limitations
+
+- **Single client per page.** Each proxied `/devtools/page/<id>` WebSocket
+  accepts exactly one downstream client at a time. A second connection gets
+  a `503 Service Unavailable`. CDP sessions carry per-client state
+  (outstanding request ids, enabled domains, target attachment), so honest
+  multiplexing would need id remapping that isn't implemented yet. Run one
+  automation client per device for now.
+- **Android only.** iOS is not supported in this repo — see below.
+- **Single upstream Chrome.** mobilebridge attaches to the first devtools
+  abstract socket it finds (`chrome_devtools_remote` preferred, WebView
+  fallback). If you need to target a specific WebView host on a device with
+  several, use `adb forward` manually and point mobilebridge at the local
+  port.
+
 ## iOS
 
 mobilebridge is Android-only. iOS Safari support is provided as part of the broader VulpineOS commercial offering; Apple's WebKit Remote Inspector Protocol is undocumented and version-fragile, so it lives behind that ecosystem rather than in this repo.

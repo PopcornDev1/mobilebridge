@@ -17,6 +17,14 @@ import (
 // Proxy owns one upstream CDP WebSocket connection to Chrome on the device
 // plus, while Serve is running, exactly one downstream client WebSocket. It
 // pumps frames bidirectionally and tears everything down on Close.
+//
+// Multi-client fan-out is intentionally NOT supported in this MVP. A CDP
+// session is inherently stateful (target ids, enabled domains, outstanding
+// request ids) so fan-out would require message multiplexing with per-client
+// id remapping. Until that lands, Serve will refuse a second concurrent
+// client by returning ErrBusy; callers wiring Serve into an HTTP handler
+// should surface that as a 503 so clients get a clear failure instead of
+// silent frame interleaving.
 type Proxy struct {
 	serial     string
 	localPort  int
@@ -28,9 +36,19 @@ type Proxy struct {
 	// and the downstream->upstream pump both use it.
 	writeMu sync.Mutex
 
+	// serveMu guards single-client enforcement. busy is set while Serve is
+	// actively pumping frames.
+	serveMu sync.Mutex
+	busy    bool
+
 	closeOnce sync.Once
 	closed    chan struct{}
 }
+
+// ErrBusy is returned by Proxy.Serve if a second client tries to attach
+// while another is already connected. See the Proxy doc comment for the
+// single-client limitation.
+var ErrBusy = errors.New("mobilebridge: proxy is already serving a client")
 
 // NewProxy sets up adb forwarding to the given device's Chrome devtools
 // socket, queries Chrome's /json/version endpoint to find the browser-level
@@ -129,12 +147,25 @@ func (p *Proxy) sendUpstream(method string, params any) error {
 	return p.upstream.WriteMessage(websocket.TextMessage, b)
 }
 
-// Serve pumps frames in both directions until either side hangs up. It must
-// be called at most once per Proxy.
+// Serve pumps frames in both directions until either side hangs up. Only
+// one client may be attached at a time; a second concurrent call returns
+// ErrBusy without touching the connection.
 func (p *Proxy) Serve(downstream *websocket.Conn) error {
 	if downstream == nil {
 		return errors.New("mobilebridge: nil downstream")
 	}
+	p.serveMu.Lock()
+	if p.busy {
+		p.serveMu.Unlock()
+		return ErrBusy
+	}
+	p.busy = true
+	p.serveMu.Unlock()
+	defer func() {
+		p.serveMu.Lock()
+		p.busy = false
+		p.serveMu.Unlock()
+	}()
 	errCh := make(chan error, 2)
 
 	// Downstream -> upstream. Intercept synthetic MobileBridge.* methods
@@ -260,3 +291,11 @@ func (p *Proxy) Close() error {
 // Upstream exposes the underlying connection for advanced callers. It is not
 // safe for concurrent writes; use sendUpstream instead.
 func (p *Proxy) Upstream() *websocket.Conn { return p.upstream }
+
+// Busy reports whether a client is currently attached via Serve. Used by
+// HTTP handlers to reject a second connection with 503 before upgrading.
+func (p *Proxy) Busy() bool {
+	p.serveMu.Lock()
+	defer p.serveMu.Unlock()
+	return p.busy
+}
