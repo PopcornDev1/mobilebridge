@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -220,5 +221,32 @@ func TestProxyUnknownMobileBridgeMethod(t *testing.T) {
 	}
 	if resp.ID != 7 {
 		t.Errorf("id = %d, want 7", resp.ID)
+	}
+}
+
+// TestProxyFastPathSkipsUnmarshal feeds 1000 non-MobileBridge frames through
+// maybeHandleSynthetic and asserts that the JSON decoder is never invoked.
+func TestProxyFastPathSkipsUnmarshal(t *testing.T) {
+	p := &Proxy{}
+	p.registerDefaultMethodHandlers()
+
+	atomic.StoreUint64(&unmarshalProbeCount, 0)
+	frame := []byte(`{"id":1,"method":"Page.navigate","params":{"url":"https://example.com"}}`)
+	for i := 0; i < 1000; i++ {
+		if handled, _ := p.maybeHandleSynthetic(frame); handled {
+			t.Fatalf("iter %d: non-MobileBridge frame should not be handled", i)
+		}
+	}
+	if got := atomic.LoadUint64(&unmarshalProbeCount); got != 0 {
+		t.Errorf("unmarshalProbeCount = %d, want 0 (fast-path should skip all)", got)
+	}
+
+	// Positive control: a real MobileBridge.tap frame should hit the decoder.
+	hit := []byte(`{"id":9,"method":"MobileBridge.tap","params":{"X":5,"Y":5}}`)
+	if handled, _ := p.maybeHandleSynthetic(hit); !handled {
+		t.Fatal("MobileBridge.tap frame should be handled")
+	}
+	if got := atomic.LoadUint64(&unmarshalProbeCount); got != 1 {
+		t.Errorf("unmarshalProbeCount after hit = %d, want 1", got)
 	}
 }

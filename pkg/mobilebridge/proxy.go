@@ -1,6 +1,7 @@
 package mobilebridge
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,10 +10,20 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// mobileBridgeMethodMarker is the fast-path sentinel for maybeHandleSynthetic.
+// Any CDP frame whose body does NOT contain this byte sequence cannot possibly
+// be a MobileBridge.* synthetic method, so we skip the json.Unmarshal entirely.
+var mobileBridgeMethodMarker = []byte(`"MobileBridge.`)
+
+// unmarshalProbeCount is incremented every time maybeHandleSynthetic actually
+// decodes a frame. Tests use it to assert the fast-path is engaging.
+var unmarshalProbeCount uint64
 
 // Proxy owns one upstream CDP WebSocket connection to Chrome on the device
 // plus, while Serve is running, exactly one downstream client WebSocket. It
@@ -355,6 +366,12 @@ type cdpErrorObject struct {
 // handled=true whenever the message was consumed; the upstream is never told
 // about synthetic methods.
 func (p *Proxy) maybeHandleSynthetic(raw []byte) (bool, []byte) {
+	// Fast path: 99.9% of CDP traffic is real Chrome methods that cannot
+	// possibly match MobileBridge.*. Skip the unmarshal for those frames.
+	if !bytes.Contains(raw, mobileBridgeMethodMarker) {
+		return false, nil
+	}
+	atomic.AddUint64(&unmarshalProbeCount, 1)
 	var probe struct {
 		ID     int64           `json:"id"`
 		Method string          `json:"method"`
@@ -368,10 +385,10 @@ func (p *Proxy) maybeHandleSynthetic(raw []byte) (bool, []byte) {
 	}
 	handler, ok := p.lookupMethod(probe.Method)
 	if !ok {
-		// Not a synthetic method — forward to upstream as usual. We still
-		// treat MobileBridge.* without a handler as handled-with-error so
-		// the caller gets a proper CDP error instead of a real Chrome
-		// "method not found" for a method Chrome doesn't know either.
+		// Not a registered synthetic method — but the fast path already
+		// confirmed it's in the MobileBridge.* namespace, so return a
+		// proper CDP "method not found" error instead of forwarding to
+		// upstream Chrome which doesn't know about MobileBridge.* either.
 		if strings.HasPrefix(probe.Method, "MobileBridge.") {
 			resp := cdpResponse{
 				ID: probe.ID,
