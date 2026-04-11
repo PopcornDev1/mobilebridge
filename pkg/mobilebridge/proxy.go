@@ -622,16 +622,20 @@ func (p *Proxy) reconnect() error {
 	return lastErr
 }
 
-// Upstream exposes the underlying connection for advanced callers. It is not
-// safe for concurrent writes; use sendUpstream instead.
+// Upstream returns the raw upstream websocket connection without locking.
+// It is intended for read-only inspection (e.g. telemetry, tests); callers
+// MUST NOT Read or Write on the returned conn — doing so races the internal
+// Serve goroutines and reconnect swap. To send a CDP frame, use a gesture
+// helper (Tap/Swipe/...) or forward the frame through Serve.
 func (p *Proxy) Upstream() *websocket.Conn {
 	p.upstreamMu.RLock()
 	defer p.upstreamMu.RUnlock()
 	return p.upstream
 }
 
-// Busy reports whether a client is currently attached via Serve. Used by
-// HTTP handlers to reject a second connection with 503 before upgrading.
+// Busy reports whether a client is currently attached via Serve. HTTP
+// handlers should check Busy before upgrading so a second concurrent
+// client sees a clean 503 instead of a silently-rejected Serve call.
 func (p *Proxy) Busy() bool {
 	p.serveMu.Lock()
 	defer p.serveMu.Unlock()

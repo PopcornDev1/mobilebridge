@@ -143,12 +143,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "mobilebridge: websocket endpoint requires RunWithProxy wiring", http.StatusServiceUnavailable)
 }
 
-// RunWithProxy is a convenience that ties together a Proxy (which holds the
-// upstream Chrome connection) and a Server's HTTP surface. It rewires the
-// /json and /devtools handlers to talk to the given proxy's local forward
-// port and upstream WebSocket.
+// RunWithProxy wires a live Proxy into an already-Started Server. After
+// this returns, the Server's /json/* endpoints forward to the proxy's
+// adb-forwarded Chrome and /devtools/page/<id> websocket handshakes are
+// routed into Proxy.Serve. Single-client: the websocket handler uses
+// Proxy.Busy to return 503 if another client is already attached.
 //
-// Call Start before RunWithProxy.
+// Call Start before RunWithProxy. Passing a nil proxy returns an error.
 func (s *Server) RunWithProxy(p *Proxy) error {
 	if p == nil {
 		return errors.New("mobilebridge: nil proxy")

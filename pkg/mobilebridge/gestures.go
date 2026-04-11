@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-// TouchPoint mirrors the CDP Input.TouchPoint type.
+// TouchPoint mirrors the CDP Input.TouchPoint payload used inside
+// Input.dispatchTouchEvent. Only X and Y are required; the other fields
+// match Chrome's wire format for advanced pressure/radius/id metadata and
+// are safe to leave zero for normal taps and swipes.
 type TouchPoint struct {
 	X           float64 `json:"x"`
 	Y           float64 `json:"y"`
@@ -20,7 +23,11 @@ type TouchPoint struct {
 	TangentialP float64 `json:"tangentialPressure,omitempty"`
 }
 
-// TouchEventParams is the payload for `Input.dispatchTouchEvent`.
+// TouchEventParams is the full payload for a single Input.dispatchTouchEvent
+// call. Callers typically do not build this directly — the Tap, LongPress,
+// Swipe, and Pinch helpers on *Proxy assemble the correct start/move/end
+// sequence — but it is exported so external code can compose custom gesture
+// sequences when needed.
 type TouchEventParams struct {
 	Type        string       `json:"type"` // touchStart | touchMove | touchEnd | touchCancel
 	TouchPoints []TouchPoint `json:"touchPoints"`
