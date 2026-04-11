@@ -83,6 +83,9 @@ const browser = await puppeteer.connect({ browserURL: 'http://localhost:9222' })
 | `--watch`        | Continuously log device hotplug add/remove events.                |
 | `--health`       | Print the resolved device + devtools socket state and exit `0`.   |
 | `--auto-restart` | If the upstream Chrome drops, relaunch instead of exiting.        |
+| `--devices`      | Print an enriched device list (Android version, SDK, RAM, battery) and exit. |
+| `--screenrecord` | Start `adb screenrecord` on server start and pull the MP4 to this path on shutdown. |
+| `--logcat`       | After bridge start, dump `adb logcat -d` filtered to Chrome/WebView tags. |
 
 ## Touch gestures
 
@@ -116,6 +119,48 @@ mobilebridge.LongPress(p, 200, 400, 800)
 ```
 
 Each helper builds the correct sequence of `Input.dispatchTouchEvent` payloads (`touchStart` → `touchMove`s → `touchEnd`) and sends them over the proxied CDP connection.
+
+## Network emulation
+
+mobilebridge exposes `Network.emulateNetworkConditions` as a Go helper that
+handles the "enable the Network domain first, then apply the throttle"
+dance and converts user-friendly kilobits-per-second into Chrome's
+bytes-per-second format:
+
+```go
+mobilebridge.EmulateNetworkConditions(p, false, 200, 1600, 750) // ~3G: 200ms latency, 1.6 Mbps down, 750 kbps up
+mobilebridge.EmulateNetworkConditions(p, true,  0,   0,    0)   // offline
+```
+
+## Device enrichment
+
+Beyond `adb devices -l`, you can enrich a `Device` with Android version,
+SDK level, total RAM, and current battery percent. Enrich runs four cheap
+`getprop`/`dumpsys`/`/proc/meminfo` reads and is best-effort per field:
+
+```go
+d := devices[0]
+_ = d.Enrich(ctx)
+fmt.Printf("android %s sdk %d ram %dMB battery %d%%\n",
+    d.AndroidVersion, d.SDKLevel, d.RAM_MB, d.BatteryPercent)
+```
+
+Or from the CLI: `mobilebridge --devices`.
+
+## Screen recording
+
+The bridge can drive `adb shell screenrecord` in the background while
+automation runs, then pull the MP4 back to your host on shutdown. It uses
+a 3-minute cap (Android's own hard limit) and a 4 Mbps bitrate by default.
+Start it either programmatically:
+
+```go
+_ = proxy.StartScreenRecording(ctx, "/tmp/run.mp4")
+// ... automation ...
+_ = proxy.StopScreenRecording(ctx)
+```
+
+or via the CLI: `mobilebridge --port 9222 --screenrecord /tmp/run.mp4`.
 
 ## Design notes
 
