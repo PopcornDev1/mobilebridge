@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -200,6 +201,191 @@ func TestProxyDoneClosedAfterReconnectGivesUp(t *testing.T) {
 		// expected
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Done() channel not closed after reconnect gave up")
+	}
+}
+
+// TestProxyReconnect_ReaderResumesAcrossSwap verifies the full read-direction
+// resumption story end-to-end: upstream1 sends 2 messages then dies, a
+// reconnect kicks off, upstream2 sends 2 more, and the downstream client
+// receives all 4 in order without the Serve loop tearing down.
+func TestProxyReconnect_ReaderResumesAcrossSwap(t *testing.T) {
+	origBackoff := reconnectBackoff
+	reconnectBackoff = []time.Duration{1 * time.Millisecond}
+	t.Cleanup(func() { reconnectBackoff = origBackoff })
+
+	origRunner := commandRunner
+	commandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { commandRunner = origRunner })
+
+	// upstream2 echoes any frame sent by the reconnect dialer and also
+	// pushes two server-initiated frames to the client once connected.
+	var up2Conn *websocket.Conn
+	var up2Mu sync.Mutex
+	upg := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	up2Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upg.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		up2Mu.Lock()
+		up2Conn = ws
+		up2Mu.Unlock()
+		// Park until client closes.
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer up2Srv.Close()
+	up2WSURL := "ws" + strings.TrimPrefix(up2Srv.URL, "http") + "/"
+
+	// /json/version serves up2.
+	jsonSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"Browser":"Chrome/stub","webSocketDebuggerUrl":%q}`, up2WSURL)
+	}))
+	defer jsonSrv.Close()
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(jsonSrv.URL, "http://"))
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	// upstream1: sends 2 frames to its client then closes.
+	up1Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upg.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"msg":1}`))
+		_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"msg":2}`))
+		// Do NOT close immediately; keep the conn alive until the proxy
+		// tries to write through it (which fails and triggers reconnect).
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer up1Srv.Close()
+	conn1, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(up1Srv.URL, "http")+"/", nil)
+	if err != nil {
+		t.Fatalf("dial up1: %v", err)
+	}
+
+	p := &Proxy{
+		serial:     "STUB",
+		localPort:  port,
+		remoteSock: "chrome_devtools_remote",
+		upstream:   conn1,
+		closed:     make(chan struct{}),
+	}
+	p.registerDefaultMethodHandlers()
+
+	// Downstream client wired through p.Serve.
+	serveErr := make(chan error, 1)
+	dsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upg.Upgrade(w, r, nil)
+		if err != nil {
+			serveErr <- err
+			return
+		}
+		serveErr <- p.Serve(context.Background(), ws)
+	}))
+	defer dsSrv.Close()
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(dsSrv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close()
+
+	// Read the first 2 messages coming from up1 via the reader pump.
+	received := make(chan string, 4)
+	go func() {
+		for i := 0; i < 4; i++ {
+			_, data, err := client.ReadMessage()
+			if err != nil {
+				return
+			}
+			received <- string(data)
+		}
+	}()
+	first := []string{}
+	for i := 0; i < 2; i++ {
+		select {
+		case m := <-received:
+			first = append(first, m)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out reading initial messages, got %d", len(first))
+		}
+	}
+	if first[0] != `{"msg":1}` || first[1] != `{"msg":2}` {
+		t.Fatalf("first messages wrong: %v", first)
+	}
+
+	// Drive reconnect directly. This matches the production path where
+	// the writer-side write failure calls p.reconnect(): gate gets set,
+	// old conn closes, the reader observes gate != nil on its read
+	// error, waits on gate, and resumes on the new upstream. Invoking
+	// reconnect here isolates the reader-resumption property from the
+	// write-failure-detection race.
+	up1Srv.Close()
+	reconnectDone := make(chan error, 1)
+	go func() { reconnectDone <- p.reconnect() }()
+	select {
+	case err := <-reconnectDone:
+		if err != nil {
+			t.Fatalf("reconnect: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnect did not complete")
+	}
+
+	// Wait for reconnect to swap in up2.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		up2Mu.Lock()
+		ready := up2Conn != nil
+		up2Mu.Unlock()
+		if ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	up2Mu.Lock()
+	conn := up2Conn
+	up2Mu.Unlock()
+	if conn == nil {
+		t.Fatal("up2 never connected — reconnect didn't fire")
+	}
+
+	// From up2, push 2 more frames to exercise the resumed reader.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"msg":3}`)); err != nil {
+		t.Fatalf("write msg3: %v", err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"msg":4}`)); err != nil {
+		t.Fatalf("write msg4: %v", err)
+	}
+
+	rest := []string{}
+	for i := 0; i < 2; i++ {
+		select {
+		case m := <-received:
+			rest = append(rest, m)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out reading post-reconnect messages, got %d: %v", len(rest), rest)
+		}
+	}
+	if rest[0] != `{"msg":3}` || rest[1] != `{"msg":4}` {
+		t.Errorf("post-reconnect messages wrong: %v", rest)
+	}
+
+	_ = client.Close()
+	_ = p.Close()
+	select {
+	case <-serveErr:
+	case <-time.After(2 * time.Second):
 	}
 }
 
