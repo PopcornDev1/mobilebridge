@@ -73,6 +73,34 @@ Point any CDP client at `http://localhost:9222` exactly as you would for a local
 const browser = await puppeteer.connect({ browserURL: 'http://localhost:9222' });
 ```
 
+## CLI flags
+
+| Flag             | Description                                                       |
+| ---------------- | ----------------------------------------------------------------- |
+| `--list`         | List attached devices with Chrome/WebView labeling and exit.      |
+| `--device`       | Device serial to bind (auto-pick when only one device is ready).  |
+| `--port`         | Local TCP port to serve CDP on (default `9222`).                  |
+| `--watch`        | Continuously log device hotplug add/remove events.                |
+| `--health`       | Print the resolved device + devtools socket state and exit `0`.   |
+| `--auto-restart` | If the upstream Chrome drops, relaunch instead of exiting.        |
+
+## Touch gestures
+
+On top of raw CDP, mobilebridge exposes synthetic `MobileBridge.*` methods
+over the same WebSocket. Any CDP client can call them directly:
+
+```js
+// Puppeteer / chrome-remote-interface
+const client = await page.target().createCDPSession();
+await client.send('MobileBridge.tap',       { x: 200, y: 400 });
+await client.send('MobileBridge.swipe',     { fromX: 500, fromY: 1200, toX: 500, toY: 300, durationMs: 300 });
+await client.send('MobileBridge.pinch',     { centerX: 540, centerY: 960, scale: 0.5 });
+await client.send('MobileBridge.longPress', { x: 200, y: 400, durationMs: 800 });
+```
+
+Internally each call expands into a sequence of `Input.dispatchTouchEvent`
+frames: `touchStart` -> interpolated `touchMove`s -> `touchEnd`.
+
 ## Touch gesture extensions
 
 Standard CDP has `Input.dispatchTouchEvent`, but it's fiddly to drive interactive gestures by hand. mobilebridge exposes higher-level helpers as Go functions in `pkg/mobilebridge`:
@@ -109,6 +137,43 @@ Each helper builds the correct sequence of `Input.dispatchTouchEvent` payloads (
   fallback). If you need to target a specific WebView host on a device with
   several, use `adb forward` manually and point mobilebridge at the local
   port.
+
+## Troubleshooting
+
+Common ADB issues and how to unstick them:
+
+- **`adb devices` shows `unauthorized`.** Unplug, replug, and accept the
+  RSA fingerprint prompt on the device. On some OEMs you must accept the
+  dialog every time the cable is reseated.
+- **`adb devices` shows `offline`.** Run `adb kill-server && adb start-server`
+  and replug. Android Studio / Scrcpy sometimes grabs the ADB server in a
+  bad state.
+- **`no chrome devtools socket found on device`.** Chrome for Android only
+  exposes the socket when at least one tab is open in the foreground and
+  USB debugging for Chrome is enabled (`chrome://inspect` -> Discover USB
+  devices from a desktop Chrome once to prime it).
+- **`adb forward` succeeds but `/json/version` 502s.** The forward is
+  racing Chrome's socket becoming writable — retry after a second, or use
+  `--auto-restart` to have mobilebridge handle it for you.
+- **Stale forwards surviving a crash.** `adb -s <serial> forward --list`
+  shows all current forwards; `adb -s <serial> forward --remove-all`
+  nukes them.
+- **Permission denied reading `/proc/net/unix`.** The device is in
+  hardened mode. Rooted builds expose the socket directly; production
+  phones rely on Chrome's `localabstract:chrome_devtools_remote` which
+  does not need root.
+
+## Compatibility
+
+| Component                    | Versions known to work                      |
+| ---------------------------- | -------------------------------------------- |
+| Android Chrome (stable)      | 100+ — anything with USB debugging support.  |
+| Android WebView              | System WebView 96+ with `setWebContentsDebuggingEnabled(true)`. |
+| Android OS                   | 8.0+ (API 26). Older devices lack the abstract socket layout mobilebridge probes for. |
+| `adb`                        | 1.0.41+ (Platform-Tools r28+). Older ADBs parse `devices -l` differently. |
+| Go (build)                   | 1.22+.                                       |
+
+Not supported: rooted-only devtools pipes, `chrome_devtools_remote_<uid>` fallback on hardened AOSP forks, Fire OS builds that strip the socket. PRs welcome.
 
 ## iOS
 
