@@ -11,12 +11,20 @@ import (
 	"strings"
 )
 
-// Device describes a single Android device as reported by `adb devices -l`.
+// Device describes a single Android device as reported by `adb devices -l`
+// plus, optionally, fields populated by Enrich from getprop/dumpsys.
 type Device struct {
 	Serial  string
 	State   string // "device", "offline", "unauthorized", ...
 	Model   string
 	Product string
+
+	// Fields populated by Enrich. Zero values mean "not enriched yet" or
+	// "this property couldn't be read" — Enrich is best-effort per field.
+	AndroidVersion string
+	SDKLevel       int
+	RAM_MB         int
+	BatteryPercent int
 }
 
 // commandRunner runs an external command and returns its combined output.
