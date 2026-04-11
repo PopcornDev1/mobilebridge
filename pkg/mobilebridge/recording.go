@@ -54,6 +54,13 @@ var (
 // for the proxy's serial and records state so StopScreenRecording can later
 // terminate it and pull the file back to outputPath on the host.
 //
+// The caller's ctx is intentionally NOT used to drive the recording
+// subprocess. Recordings live until StopScreenRecording is invoked, so
+// tying them to a short-lived request ctx (tool call, HTTP handler) would
+// cause the child process to die without flushing the .mp4 file. Instead
+// we detach from ctx via context.WithoutCancel and store the per-proxy
+// cancel func so Stop can still kill the child deterministically.
+//
 // Only one recording per Proxy is allowed; calling Start twice returns an
 // error without touching the existing recording.
 func (p *Proxy) StartScreenRecording(ctx context.Context, outputPath string) error {
@@ -66,6 +73,9 @@ func (p *Proxy) StartScreenRecording(ctx context.Context, outputPath string) err
 	if outputPath == "" {
 		return errors.New("mobilebridge: empty output path")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	screenRecordMu.Lock()
 	defer screenRecordMu.Unlock()
@@ -73,7 +83,10 @@ func (p *Proxy) StartScreenRecording(ctx context.Context, outputPath string) err
 		return errors.New("mobilebridge: screen recording already in progress for this proxy")
 	}
 
-	cctx, cancel := context.WithCancel(ctx)
+	// Detach from the caller ctx so parent cancellation (e.g. tool call
+	// timeout) does NOT tear down the long-lived recording subprocess.
+	detached := context.WithoutCancel(ctx)
+	cctx, cancel := context.WithCancel(detached)
 	args := buildScreenRecordArgs(p.serial, remoteScreenRecordPath)
 	cmd := screenRecordCmdBuilder(cctx, adbPath, args...)
 	if err := cmd.Start(); err != nil {
