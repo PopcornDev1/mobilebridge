@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -330,38 +331,50 @@ func rewriteEntry(entry map[string]interface{}, publicHost string) {
 }
 
 // rewriteWSURL replaces the host component of a ws:// URL with publicHost,
-// leaving scheme/path intact.
+// leaving scheme/path/query intact. Uses net/url.Parse so IPv6 literals like
+// ws://[::1]:9999/devtools/page/X (whose brackets contain colons) parse
+// correctly instead of breaking the naive string splice.
 func rewriteWSURL(raw, publicHost string) string {
-	idx := strings.Index(raw, "://")
-	if idx < 0 {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
 		return raw
 	}
-	scheme := raw[:idx]
-	rest := raw[idx+3:]
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		return scheme + "://" + publicHost
-	}
-	return scheme + "://" + publicHost + rest[slash:]
+	u.Host = publicHost
+	return u.String()
 }
 
-// rewriteFrontendURL rewrites the `ws=host:port` query parameter Chrome
+// rewriteFrontendURL rewrites the `ws=host:port/path` query parameter Chrome
 // embeds in devtoolsFrontendUrl so opening the inspector routes through us.
+// Chrome emits this unescaped (e.g. "ws=127.0.0.1:9222/devtools/page/ABC")
+// and we must preserve that shape — url.Values.Encode would percent-encode
+// the slashes and break every real devtools frontend. So we do a targeted
+// substring splice but use net/url to locate the `ws=` boundary robustly.
 func rewriteFrontendURL(raw, publicHost string) string {
+	// Fast path: find "ws=" literally. The value runs until the next '&'
+	// (query separator) or end-of-string. Within the value, split host from
+	// the trailing "/path" on the first '/'.
 	i := strings.Index(raw, "ws=")
 	if i < 0 {
 		return raw
 	}
 	prefix := raw[:i+3]
 	rest := raw[i+3:]
-	end := strings.IndexByte(rest, '/')
-	amp := strings.IndexByte(rest, '&')
-	cut := end
-	if amp >= 0 && (cut < 0 || amp < cut) {
-		cut = amp
+	// Value ends at next '&' in the query string.
+	valEnd := strings.IndexByte(rest, '&')
+	var value, tail string
+	if valEnd < 0 {
+		value = rest
+		tail = ""
+	} else {
+		value = rest[:valEnd]
+		tail = rest[valEnd:]
 	}
-	if cut < 0 {
-		return prefix + publicHost
+	// Within value, /path starts at the first '/' AFTER the host. IPv6
+	// bracketed host "[::1]:9222/..." has its bracket slice-safe because
+	// brackets themselves contain no '/'.
+	slash := strings.IndexByte(value, '/')
+	if slash < 0 {
+		return prefix + publicHost + tail
 	}
-	return prefix + publicHost + rest[cut:]
+	return prefix + publicHost + value[slash:] + tail
 }

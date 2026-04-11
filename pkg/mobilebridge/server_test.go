@@ -141,6 +141,64 @@ func TestJsonListCache_HitsWithin500ms(t *testing.T) {
 	}
 }
 
+// TestRewriteDevtoolsJSON_IPv6 exercises the IPv6 literal path. The naive
+// string splice in the old rewriteWSURL broke because `[::1]` contains
+// colons and the function used `strings.Index(rest, "/")` on a host slice
+// that still needed bracket-aware parsing.
+func TestRewriteDevtoolsJSON_IPv6(t *testing.T) {
+	body := []byte(`[{
+		"id":"ABC",
+		"webSocketDebuggerUrl":"ws://[::1]:9999/devtools/page/ABC",
+		"devtoolsFrontendUrl":"/devtools/inspector.html?ws=[::1]:9999/devtools/page/ABC"
+	}]`)
+	out := rewriteDevtoolsJSON(body, "[::1]:9222")
+	var entries []map[string]interface{}
+	if err := json.Unmarshal(out, &entries); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, out)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if ws, _ := entries[0]["webSocketDebuggerUrl"].(string); ws != "ws://[::1]:9222/devtools/page/ABC" {
+		t.Errorf("webSocketDebuggerUrl not rewritten: %q", ws)
+	}
+	if front, _ := entries[0]["devtoolsFrontendUrl"].(string); !strings.Contains(front, "ws=[::1]:9222/devtools/page/ABC") {
+		t.Errorf("devtoolsFrontendUrl not rewritten: %q", front)
+	}
+}
+
+func TestRewriteDevtoolsJSON_EmptyArray(t *testing.T) {
+	out := rewriteDevtoolsJSON([]byte(`[]`), "127.0.0.1:9222")
+	if string(out) != `[]` {
+		t.Errorf("empty array mutated: %q", out)
+	}
+}
+
+func TestRewriteDevtoolsJSON_DuplicateUrls(t *testing.T) {
+	body := []byte(`[
+		{"id":"A","webSocketDebuggerUrl":"ws://127.0.0.1:9999/devtools/page/A"},
+		{"id":"B","webSocketDebuggerUrl":"ws://127.0.0.1:9999/devtools/page/A"}
+	]`)
+	out := rewriteDevtoolsJSON(body, "127.0.0.1:9222")
+	var entries []map[string]interface{}
+	if err := json.Unmarshal(out, &entries); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, e := range entries {
+		if ws, _ := e["webSocketDebuggerUrl"].(string); ws != "ws://127.0.0.1:9222/devtools/page/A" {
+			t.Errorf("entry not rewritten: %q", ws)
+		}
+	}
+}
+
+func TestRewriteDevtoolsJSON_MalformedJSON(t *testing.T) {
+	body := []byte(`[{"webSocketDebuggerUrl": not-valid-json}`)
+	out := rewriteDevtoolsJSON(body, "127.0.0.1:9222")
+	if string(out) != string(body) {
+		t.Errorf("malformed body should pass through, got %q", out)
+	}
+}
+
 // fmtSscanfPort extracts a port from "host:port".
 func fmtSscanfPort(hostport string, out *int) (int, error) {
 	i := strings.LastIndex(hostport, ":")
