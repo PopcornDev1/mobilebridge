@@ -109,13 +109,14 @@ frames: `touchStart` -> interpolated `touchMove`s -> `touchEnd`.
 Standard CDP has `Input.dispatchTouchEvent`, but it's fiddly to drive interactive gestures by hand. mobilebridge exposes higher-level helpers as Go functions in `pkg/mobilebridge`:
 
 ```go
-p, _ := mobilebridge.NewProxy("R58N12ABCDE", 9222)
+ctx := context.Background()
+p, _ := mobilebridge.NewProxy(ctx, "R58N12ABCDE", 9222)
 defer p.Close()
 
-mobilebridge.Tap(p, 200, 400)
-mobilebridge.Swipe(p, 500, 1200, 500, 300, 300)         // scroll up
-mobilebridge.Pinch(p, 540, 960, 0.5)                    // pinch out
-mobilebridge.LongPress(p, 200, 400, 800)
+p.Tap(ctx, 200, 400)
+p.Swipe(ctx, 500, 1200, 500, 300, 300)         // scroll up
+p.Pinch(ctx, 540, 960, 0.5)                    // pinch out
+p.LongPress(ctx, 200, 400, 800)
 ```
 
 Each helper builds the correct sequence of `Input.dispatchTouchEvent` payloads (`touchStart` → `touchMove`s → `touchEnd`) and sends them over the proxied CDP connection.
@@ -161,6 +162,43 @@ _ = proxy.StopScreenRecording(ctx)
 ```
 
 or via the CLI: `mobilebridge --port 9222 --screenrecord /tmp/run.mp4`.
+
+## Proxy lifecycle
+
+A `*Proxy` owns one upstream CDP websocket plus the adb forward that
+connects to it. The usual shape is:
+
+```go
+ctx := context.Background()
+p, err := mobilebridge.NewProxy(ctx, serial, 9222)
+if err != nil { log.Fatal(err) }
+defer p.Close()
+
+// p.Serve(ctx, downstreamWS) is driven by the HTTP handler wired up via
+// Server.RunWithProxy. Only one downstream client at a time.
+
+select {
+case <-ctx.Done():
+    // shut down
+case <-p.Done():
+    // upstream permanently lost (reconnect exhausted backoff) — rebuild
+}
+```
+
+`Done()` returns a channel closed either by `Close()` or when `reconnect`
+gives up after its escalating backoff. Before that, transient ADB forward
+drops are recovered internally without tearing the Serve loop down.
+
+## Sentinel errors
+
+Callers can match specific failure classes with `errors.Is`:
+
+| Error                           | Meaning                                                               |
+| ------------------------------- | ---------------------------------------------------------------------- |
+| `mobilebridge.ErrBusy`          | `Proxy.Serve` refused a second concurrent client (single-client MVP).  |
+| `mobilebridge.ErrDeviceNotFound`| Operation targeted a serial that isn't attached.                      |
+| `mobilebridge.ErrADBMissing`    | `adb` is not on `$PATH` — install platform-tools.                     |
+| `mobilebridge.ErrNoDevtoolsSocket` | `/proc/net/unix` on the device has no `chrome_devtools_remote` or `webview_devtools_remote_<pid>` — Chrome isn't running or USB debugging isn't granted. |
 
 ## Design notes
 
