@@ -176,3 +176,31 @@ func TestChromeDevtoolsSocketNone(t *testing.T) {
 		t.Error("expected error when no socket present")
 	}
 }
+
+func TestChromeDevtoolsSocketInfoChrome(t *testing.T) {
+	withStubRunner(t, sampleProcNetUnixChrome, nil)
+	info, err := ChromeDevtoolsSocketInfo("R58N")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "chrome_devtools_remote" {
+		t.Errorf("name = %q", info.Name)
+	}
+	if info.Kind != SocketKindChrome {
+		t.Errorf("kind = %v", info.Kind)
+	}
+}
+
+func TestChromeDevtoolsSocketInfoWebView(t *testing.T) {
+	withStubRunner(t, sampleProcNetUnixWebviewOnly, nil)
+	info, err := ChromeDevtoolsSocketInfo("R58N")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Kind != SocketKindWebView {
+		t.Errorf("kind = %v, want webview", info.Kind)
+	}
+	if info.Name != "webview_devtools_remote_9876" {
+		t.Errorf("name = %q", info.Name)
+	}
+}

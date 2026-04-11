@@ -117,21 +117,74 @@ func Unforward(serial string, localPort int) error {
 // Typical forms: "chrome_devtools_remote" and "webview_devtools_remote_<pid>".
 var devtoolsSocketRe = regexp.MustCompile(`@((?:chrome|webview)_devtools_remote[_A-Za-z0-9]*)`)
 
+// DevtoolsSocketKind distinguishes Chrome's stable devtools socket from a
+// WebView host's. CLI tools can use this to label entries clearly.
+type DevtoolsSocketKind int
+
+const (
+	// SocketKindUnknown is a devtools socket we couldn't classify.
+	SocketKindUnknown DevtoolsSocketKind = iota
+	// SocketKindChrome is a full Chrome process (@chrome_devtools_remote).
+	SocketKindChrome
+	// SocketKindWebView is a WebView host process
+	// (@webview_devtools_remote_<pid>).
+	SocketKindWebView
+)
+
+func (k DevtoolsSocketKind) String() string {
+	switch k {
+	case SocketKindChrome:
+		return "chrome"
+	case SocketKindWebView:
+		return "webview"
+	default:
+		return "unknown"
+	}
+}
+
+// DevtoolsSocket describes an abstract socket exposing a Chrome DevTools
+// endpoint on the device. The Name field is the abstract socket name (no
+// leading @); Kind tells the caller whether to show "Chrome" or "WebView".
+type DevtoolsSocket struct {
+	Name string
+	Kind DevtoolsSocketKind
+}
+
 // ChromeDevtoolsSocket queries /proc/net/unix on the device and returns the
-// name of the abstract socket that Chrome (or a WebView host) is listening on.
+// name of the abstract socket that Chrome (or a WebView host) is listening
+// on. It returns just the socket name for backwards compatibility; callers
+// that need the Chrome-vs-WebView distinction should use
+// ChromeDevtoolsSocketInfo instead.
 func ChromeDevtoolsSocket(serial string) (string, error) {
+	info, err := ChromeDevtoolsSocketInfo(serial)
+	if err != nil {
+		return "", err
+	}
+	return info.Name, nil
+}
+
+// ChromeDevtoolsSocketInfo is like ChromeDevtoolsSocket but also reports
+// whether the socket belongs to Chrome or a WebView host.
+func ChromeDevtoolsSocketInfo(serial string) (DevtoolsSocket, error) {
 	if serial == "" {
-		return "", errors.New("mobilebridge: empty serial")
+		return DevtoolsSocket{}, errors.New("mobilebridge: empty serial")
 	}
 	out, err := runADB("-s", serial, "shell", "cat", "/proc/net/unix")
 	if err != nil {
-		return "", fmt.Errorf("adb shell cat /proc/net/unix: %w: %s", err, string(out))
+		return DevtoolsSocket{}, fmt.Errorf("adb shell cat /proc/net/unix: %w: %s", err, string(out))
 	}
 	name, ok := parseDevtoolsSocket(string(out))
 	if !ok {
-		return "", errors.New("mobilebridge: no chrome devtools socket found on device")
+		return DevtoolsSocket{}, errors.New("mobilebridge: no chrome devtools socket found on device")
 	}
-	return name, nil
+	kind := SocketKindUnknown
+	switch {
+	case strings.HasPrefix(name, "chrome_devtools_remote"):
+		kind = SocketKindChrome
+	case strings.HasPrefix(name, "webview_devtools_remote"):
+		kind = SocketKindWebView
+	}
+	return DevtoolsSocket{Name: name, Kind: kind}, nil
 }
 
 // parseDevtoolsSocket scans /proc/net/unix output for a devtools abstract
