@@ -107,6 +107,9 @@ func parseDevices(out string) []Device {
 }
 
 // Forward runs `adb -s <serial> forward tcp:<localPort> localabstract:<remoteAbstract>`.
+// If adb reports the device is not attached, the returned error wraps
+// ErrDeviceNotFound so callers can errors.Is-check the operator-common
+// "cable unplugged / wrong serial" failure mode.
 func Forward(ctx context.Context, serial string, localPort int, remoteAbstract string) error {
 	if serial == "" {
 		return errors.New("mobilebridge: empty serial")
@@ -116,9 +119,26 @@ func Forward(ctx context.Context, serial string, localPort int, remoteAbstract s
 		"localabstract:"+remoteAbstract,
 	)
 	if err != nil {
+		if isDeviceNotFound(out, err) {
+			return fmt.Errorf("%w: serial=%s: %s", ErrDeviceNotFound, serial, strings.TrimSpace(string(out)))
+		}
 		return fmt.Errorf("adb forward: %w: %s", err, string(out))
 	}
 	return nil
+}
+
+// isDeviceNotFound reports whether an adb command's combined output/error
+// indicates the target serial isn't currently attached. adb is not great
+// about exit codes here — the signal lives in the text. We match the two
+// shapes we've seen in the wild: "error: device 'X' not found" and
+// "error: device not found".
+func isDeviceNotFound(out []byte, err error) bool {
+	msg := strings.ToLower(string(out))
+	if err != nil {
+		msg += " " + strings.ToLower(err.Error())
+	}
+	return strings.Contains(msg, "device not found") ||
+		strings.Contains(msg, "device '") && strings.Contains(msg, "not found")
 }
 
 // Unforward runs `adb -s <serial> forward --remove tcp:<localPort>`.

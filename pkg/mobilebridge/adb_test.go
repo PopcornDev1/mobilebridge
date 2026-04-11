@@ -205,6 +205,41 @@ func TestChromeDevtoolsSocketInfoWebView(t *testing.T) {
 	}
 }
 
+// TestErrADBMissing_Wrapped verifies ListDevices wraps ErrADBMissing when
+// exec.LookPath("adb") fails, so callers can errors.Is-check the sentinel.
+func TestErrADBMissing_Wrapped(t *testing.T) {
+	origLookup := adbLookupFn
+	adbLookupFn = func(string) (string, error) { return "", errors.New("exec: \"adb\": executable file not found in $PATH") }
+	t.Cleanup(func() { adbLookupFn = origLookup })
+
+	_, err := ListDevices(context.Background())
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if !errors.Is(err, ErrADBMissing) {
+		t.Errorf("errors.Is(err, ErrADBMissing) = false; err = %v", err)
+	}
+}
+
+// TestErrDeviceNotFound_Wrapped stubs commandRunner so adb forward returns
+// the canonical "device 'X' not found" stderr, and asserts Forward wraps
+// ErrDeviceNotFound.
+func TestErrDeviceNotFound_Wrapped(t *testing.T) {
+	orig := commandRunner
+	t.Cleanup(func() { commandRunner = orig })
+	commandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("error: device 'R58NFAKE' not found\n"), errors.New("exit status 1")
+	}
+
+	err := Forward(context.Background(), "R58NFAKE", 9222, "chrome_devtools_remote")
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if !errors.Is(err, ErrDeviceNotFound) {
+		t.Errorf("errors.Is(err, ErrDeviceNotFound) = false; err = %v", err)
+	}
+}
+
 // TestSentinelErrors exercises the exported error sentinels so callers can
 // use errors.Is to match failure modes without parsing error strings.
 func TestSentinelErrors(t *testing.T) {
