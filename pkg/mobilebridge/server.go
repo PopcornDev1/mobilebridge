@@ -1,6 +1,7 @@
 package mobilebridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -232,7 +234,7 @@ func (s *Server) RunWithProxy(p *Proxy) error {
 //
 // If the body isn't JSON we recognise, it's returned unchanged.
 func rewriteDevtoolsJSON(body []byte, publicHost string) []byte {
-	trimmed := bytesTrimSpace(body)
+	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
 		return body
 	}
@@ -277,13 +279,13 @@ func rewriteEntry(entry map[string]interface{}, publicHost string) {
 // rewriteWSURL replaces the host component of a ws:// URL with publicHost,
 // leaving scheme/path intact.
 func rewriteWSURL(raw, publicHost string) string {
-	idx := indexOf(raw, "://")
+	idx := strings.Index(raw, "://")
 	if idx < 0 {
 		return raw
 	}
 	scheme := raw[:idx]
 	rest := raw[idx+3:]
-	slash := indexOfByte(rest, '/')
+	slash := strings.IndexByte(rest, '/')
 	if slash < 0 {
 		return scheme + "://" + publicHost
 	}
@@ -293,14 +295,14 @@ func rewriteWSURL(raw, publicHost string) string {
 // rewriteFrontendURL rewrites the `ws=host:port` query parameter Chrome
 // embeds in devtoolsFrontendUrl so opening the inspector routes through us.
 func rewriteFrontendURL(raw, publicHost string) string {
-	i := indexOf(raw, "ws=")
+	i := strings.Index(raw, "ws=")
 	if i < 0 {
 		return raw
 	}
 	prefix := raw[:i+3]
 	rest := raw[i+3:]
-	end := indexOfByte(rest, '/')
-	amp := indexOfByte(rest, '&')
+	end := strings.IndexByte(rest, '/')
+	amp := strings.IndexByte(rest, '&')
 	cut := end
 	if amp >= 0 && (cut < 0 || amp < cut) {
 		cut = amp
@@ -309,30 +311,4 @@ func rewriteFrontendURL(raw, publicHost string) string {
 		return prefix + publicHost
 	}
 	return prefix + publicHost + rest[cut:]
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
-func indexOfByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
-}
-
-func bytesTrimSpace(b []byte) []byte {
-	i := 0
-	for i < len(b) && (b[i] == ' ' || b[i] == '\t' || b[i] == '\n' || b[i] == '\r') {
-		i++
-	}
-	return b[i:]
 }
