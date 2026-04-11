@@ -389,6 +389,153 @@ func TestProxyReconnect_ReaderResumesAcrossSwap(t *testing.T) {
 	}
 }
 
+// TestProxy_ReaderInitiatedReconnect verifies that when the upstream breaks
+// the READ side first (while no write is in flight), the reader goroutine
+// kicks off a reconnect itself instead of tearing down the Serve loop. This
+// exercises the ensureReconnect() coordination path.
+func TestProxy_ReaderInitiatedReconnect(t *testing.T) {
+	origBackoff := reconnectBackoff
+	reconnectBackoff = []time.Duration{1 * time.Millisecond}
+	t.Cleanup(func() { reconnectBackoff = origBackoff })
+
+	origRunner := commandRunner
+	commandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { commandRunner = origRunner })
+
+	// upstream #2 that the reconnect dial should land on.
+	var up2Conn *websocket.Conn
+	var up2Mu sync.Mutex
+	upg := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	up2Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upg.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		up2Mu.Lock()
+		up2Conn = ws
+		up2Mu.Unlock()
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer up2Srv.Close()
+	up2WSURL := "ws" + strings.TrimPrefix(up2Srv.URL, "http") + "/"
+
+	jsonSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"Browser":"Chrome/stub","webSocketDebuggerUrl":%q}`, up2WSURL)
+	}))
+	defer jsonSrv.Close()
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(jsonSrv.URL, "http://"))
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	// upstream #1: accepts, writes a single frame, then hard-closes the
+	// connection without waiting for any client read. This forces the
+	// proxy's reader goroutine to observe a ReadMessage error while the
+	// writer goroutine is idle — the canonical reader-initiated scenario.
+	up1Ready := make(chan struct{})
+	up1Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upg.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		close(up1Ready)
+		_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"msg":"hello"}`))
+		// Hard close so the reader gets an error.
+		_ = ws.Close()
+	}))
+	defer up1Srv.Close()
+
+	conn1, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(up1Srv.URL, "http")+"/", nil)
+	if err != nil {
+		t.Fatalf("dial up1: %v", err)
+	}
+	<-up1Ready
+
+	p := &Proxy{
+		serial:     "STUB",
+		localPort:  port,
+		remoteSock: "chrome_devtools_remote",
+		upstream:   conn1,
+		closed:     make(chan struct{}),
+	}
+	p.registerDefaultMethodHandlers()
+
+	// Wire downstream.
+	serveErr := make(chan error, 1)
+	dsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upg.Upgrade(w, r, nil)
+		if err != nil {
+			serveErr <- err
+			return
+		}
+		serveErr <- p.Serve(context.Background(), ws)
+	}))
+	defer dsSrv.Close()
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(dsSrv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close()
+
+	// The reader should see up1's hello frame, then observe the close as
+	// an error, and kick off a reconnect. Read the first frame.
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, data, err := client.ReadMessage()
+	if err != nil {
+		t.Fatalf("expected hello frame, got err: %v", err)
+	}
+	if string(data) != `{"msg":"hello"}` {
+		t.Errorf("first frame = %q", string(data))
+	}
+	_ = client.SetReadDeadline(time.Time{})
+
+	// Wait for up2 to receive the reconnect dial.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		up2Mu.Lock()
+		ready := up2Conn != nil
+		up2Mu.Unlock()
+		if ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	up2Mu.Lock()
+	got := up2Conn
+	up2Mu.Unlock()
+	if got == nil {
+		t.Fatal("reader did not initiate reconnect; up2 never received a dial")
+	}
+
+	// The downstream client must NOT have seen a close. Send a new frame
+	// from up2 and ensure the client receives it — proves Serve is still
+	// pumping.
+	if err := got.WriteMessage(websocket.TextMessage, []byte(`{"msg":"post"}`)); err != nil {
+		t.Fatalf("write on up2: %v", err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, data, err = client.ReadMessage()
+	if err != nil {
+		t.Fatalf("client did not receive post-reconnect frame: %v", err)
+	}
+	if string(data) != `{"msg":"post"}` {
+		t.Errorf("post frame = %q", string(data))
+	}
+
+	_ = client.Close()
+	_ = p.Close()
+	select {
+	case <-serveErr:
+	case <-time.After(2 * time.Second):
+	}
+}
+
 // TestProxyReconnect_ReaderResumes verifies that when reconnect() swaps in a
 // fresh upstream, the Serve reader goroutine picks up the new connection
 // instead of staying blocked on the old (closed) one. The bug before M2 was

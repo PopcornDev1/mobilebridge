@@ -312,6 +312,28 @@ func (p *Proxy) Serve(ctx context.Context, downstream *websocket.Conn) error {
 	}()
 	errCh := make(chan error, 2)
 
+	// serveDone is closed as soon as either direction errors, so the other
+	// goroutine can tell "this Serve call is tearing down" and skip the
+	// reconnect dance. Without this the reader could notice its upstream
+	// read fail (because downstream closed and the writer bailed) and then
+	// try to reconnect forever in the background, outliving the test/caller.
+	serveDone := make(chan struct{})
+	var serveDoneOnce sync.Once
+	signalServeDone := func() { serveDoneOnce.Do(func() { close(serveDone) }) }
+	// serveWG is waited on before Serve returns so the two pump goroutines
+	// can't outlive the call — important for goroutine hygiene and for
+	// avoiding races on package-level test overrides like reconnectBackoff.
+	var serveWG sync.WaitGroup
+	serveWG.Add(2)
+	serveActive := func() bool {
+		select {
+		case <-serveDone:
+			return false
+		default:
+			return true
+		}
+	}
+
 	// downstreamWriteMu serializes writes on the downstream connection.
 	// Synthetic responses and the upstream->downstream pump both use it.
 	var downstreamWriteMu sync.Mutex
@@ -324,6 +346,8 @@ func (p *Proxy) Serve(ctx context.Context, downstream *websocket.Conn) error {
 	// Downstream -> upstream. Intercept synthetic MobileBridge.* methods
 	// and translate them into real CDP calls; forward everything else.
 	go func() {
+		defer serveWG.Done()
+		defer signalServeDone()
 		for {
 			mt, data, err := downstream.ReadMessage()
 			if err != nil {
@@ -344,9 +368,14 @@ func (p *Proxy) Serve(ctx context.Context, downstream *websocket.Conn) error {
 			}
 			if werr := p.writeUpstream(data); werr != nil {
 				// Upstream died mid-write — most commonly because the
-				// adb forward dropped. Try to re-establish; if that
-				// succeeds, replay this frame on the new connection.
-				if rerr := p.reconnect(); rerr != nil {
+				// adb forward dropped. Try to re-establish (or wait for
+				// the reader to finish its own in-flight reconnect); if
+				// that succeeds, replay this frame on the new conn.
+				if !serveActive() {
+					errCh <- werr
+					return
+				}
+				if rerr := p.ensureReconnect(); rerr != nil {
 					errCh <- werr
 					return
 				}
@@ -360,8 +389,12 @@ func (p *Proxy) Serve(ctx context.Context, downstream *websocket.Conn) error {
 
 	// Upstream -> downstream. When the upstream read fails we check for an
 	// in-flight reconnect; if one is in progress we wait for it and pick up
-	// the new connection instead of tearing the whole Serve loop down.
+	// the new connection instead of tearing the whole Serve loop down. If
+	// Serve itself is already tearing down (writer bailed, ctx cancelled)
+	// we exit instead of kicking off a reconnect we can't deliver through.
 	go func() {
+		defer serveWG.Done()
+		defer signalServeDone()
 		for {
 			p.upstreamMu.RLock()
 			conn := p.upstream
@@ -369,7 +402,12 @@ func (p *Proxy) Serve(ctx context.Context, downstream *websocket.Conn) error {
 			p.upstreamMu.RUnlock()
 			if conn == nil {
 				if gate != nil {
-					<-gate
+					select {
+					case <-gate:
+					case <-serveDone:
+						errCh <- errors.New("mobilebridge: serve exiting")
+						return
+					}
 					continue
 				}
 				errCh <- errors.New("mobilebridge: upstream nil and no reconnect in progress")
@@ -377,23 +415,21 @@ func (p *Proxy) Serve(ctx context.Context, downstream *websocket.Conn) error {
 			}
 			mt, data, err := conn.ReadMessage()
 			if err != nil {
-				// Was this because reconnect() closed the conn under us?
-				p.upstreamMu.RLock()
-				gate := p.reconnectGate
-				p.upstreamMu.RUnlock()
-				if gate != nil {
-					<-gate
-					p.upstreamMu.RLock()
-					rerr := p.reconnectErr
-					p.upstreamMu.RUnlock()
-					if rerr != nil {
-						errCh <- err
-						return
-					}
-					continue
+				if !serveActive() {
+					errCh <- err
+					return
 				}
-				errCh <- err
-				return
+				// Either the writer already initiated a reconnect and
+				// closed the conn under us (reconnectGate is set), or we
+				// are the first side to notice upstream loss and need to
+				// kick off the reconnect ourselves. ensureReconnect() does
+				// the right thing in both cases: it waits on an in-flight
+				// attempt or starts a new one, returning the final error.
+				if rerr := p.ensureReconnect(); rerr != nil {
+					errCh <- err
+					return
+				}
+				continue
 			}
 			if err := writeDownstream(mt, data); err != nil {
 				errCh <- err
@@ -402,14 +438,34 @@ func (p *Proxy) Serve(ctx context.Context, downstream *websocket.Conn) error {
 		}
 	}()
 
+	var exitErr error
 	select {
 	case err := <-errCh:
-		return err
+		exitErr = err
 	case <-p.closed:
-		return nil
+		// exitErr stays nil
 	case <-ctx.Done():
-		return ctx.Err()
+		exitErr = ctx.Err()
 	}
+	// Tell both pump goroutines to bail. Close the upstream so any in-flight
+	// ReadMessage in the reader returns immediately; close the downstream so
+	// the writer's ReadMessage returns too. We close upstream via reconnect()
+	// style only when the conn is still the same — but since tests hold real
+	// connections we just unblock the pumps by calling Close on whatever we
+	// hold. The defer above closes serveDone so serveActive() returns false.
+	signalServeDone()
+	p.upstreamMu.RLock()
+	up := p.upstream
+	p.upstreamMu.RUnlock()
+	if up != nil {
+		_ = up.SetReadDeadline(time.Now())
+	}
+	_ = downstream.SetReadDeadline(time.Now())
+	// Wait for both pumps to actually exit before returning so Serve's
+	// lifetime bounds the goroutines' lifetime. errCh is buffered(2) so
+	// sends never block the exit path.
+	serveWG.Wait()
+	return exitErr
 }
 
 // cdpResponse is the JSON wire format for a CDP method reply. Either Result
@@ -558,15 +614,43 @@ func (p *Proxy) writeUpstream(data []byte) error {
 	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
+// ensureReconnect starts a reconnect if one isn't already running, otherwise
+// waits on the existing attempt. Returns the final error from whichever
+// goroutine actually executed the reconnect. This is how the reader and
+// writer goroutines in Serve() coordinate: whichever side notices upstream
+// loss first kicks off the swap, and the other picks up the new conn via the
+// reconnectGate. Without this, a reader-first failure would return from
+// Serve (tearing down the loop) instead of recovering like a writer-first
+// failure does.
+func (p *Proxy) ensureReconnect() error {
+	p.upstreamMu.Lock()
+	if p.reconnectGate != nil {
+		// Someone is already reconnecting; wait for them.
+		gate := p.reconnectGate
+		p.upstreamMu.Unlock()
+		<-gate
+		p.upstreamMu.RLock()
+		err := p.reconnectErr
+		p.upstreamMu.RUnlock()
+		return err
+	}
+	p.upstreamMu.Unlock()
+	return p.reconnect()
+}
+
 // reconnect tears down the current upstream connection and tries to
 // re-establish the adb forward + Chrome WebSocket with an escalating
-// backoff. Used by Serve() when a write to upstream fails — the most
-// common cause is the adb forward dropping (cable jiggle, adb server
+// backoff. Used by Serve() when a read or write on upstream fails — the
+// most common cause is the adb forward dropping (cable jiggle, adb server
 // restart, device sleep). Returns the final error if all attempts fail.
 //
-// While reconnect runs, p.reconnectGate is non-nil and the reader goroutine
-// in Serve() will block on it after observing its ReadMessage error, so the
-// reader resumes on the new connection once the swap succeeds.
+// Callers should prefer ensureReconnect() which deduplicates concurrent
+// reader/writer invocations; reconnect() itself always runs a full cycle.
+//
+// While reconnect runs, p.reconnectGate is non-nil and the peer goroutine
+// in Serve() (reader or writer) will block on it after observing its own
+// I/O error, so the peer resumes on the new connection once the swap
+// succeeds.
 func (p *Proxy) reconnect() error {
 	// Open the gate so the reader knows to wait for us instead of tearing
 	// the whole Serve loop down. Close the old conn to unblock any
