@@ -156,6 +156,75 @@ func TestPinchOutExpands(t *testing.T) {
 	}
 }
 
+func TestSwipe_BoundsValidation(t *testing.T) {
+	f := &fakeSender{}
+	cases := [][5]int{
+		{-1, 0, 10, 10, 0},
+		{0, -1, 10, 10, 0},
+		{0, 0, -10, 10, 0},
+		{0, 0, 10, -10, 0},
+		{maxCoord + 1, 0, 10, 10, 0},
+		{0, 0, maxCoord + 1, 10, 0},
+	}
+	for _, c := range cases {
+		if err := Swipe(f, c[0], c[1], c[2], c[3], c[4]); err == nil {
+			t.Errorf("expected error for %v", c)
+		}
+	}
+	if len(f.msgs) != 0 {
+		t.Errorf("no events should have been emitted on error, got %d", len(f.msgs))
+	}
+}
+
+func TestPinch_ScaleZero(t *testing.T) {
+	f := &fakeSender{}
+	if err := Pinch(f, 500, 500, 0); err == nil {
+		t.Error("expected error for scale=0")
+	}
+	if len(f.msgs) != 0 {
+		t.Error("no events should be emitted on scale=0")
+	}
+}
+
+func TestLongPress_NegativeDuration(t *testing.T) {
+	f := &fakeSender{}
+	if err := LongPress(f, 100, 100, -1); err == nil {
+		t.Error("expected error for negative duration")
+	}
+	if err := LongPress(f, 100, 100, 0); err == nil {
+		t.Error("expected error for zero duration")
+	}
+	if len(f.msgs) != 0 {
+		t.Error("no events should be emitted on bad duration")
+	}
+}
+
+func TestTap_BasicEventSequence(t *testing.T) {
+	f := &fakeSender{}
+	if err := Tap(f, 42, 84); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.msgs) != 2 {
+		t.Fatalf("want 2 events, got %d", len(f.msgs))
+	}
+	if f.msgs[0].Type != "touchStart" {
+		t.Errorf("first event should be touchStart, got %q", f.msgs[0].Type)
+	}
+	if f.msgs[1].Type != "touchEnd" {
+		t.Errorf("second event should be touchEnd, got %q", f.msgs[1].Type)
+	}
+	if len(f.msgs[0].TouchPoints) != 1 {
+		t.Fatalf("touchStart should have 1 point, got %d", len(f.msgs[0].TouchPoints))
+	}
+	pt := f.msgs[0].TouchPoints[0]
+	if pt.X != 42 || pt.Y != 84 {
+		t.Errorf("touchStart coords = (%v,%v)", pt.X, pt.Y)
+	}
+	if len(f.msgs[1].TouchPoints) != 0 {
+		t.Errorf("touchEnd should carry 0 points, got %d", len(f.msgs[1].TouchPoints))
+	}
+}
+
 func TestPinchRejectsBadScale(t *testing.T) {
 	f := &fakeSender{}
 	if err := Pinch(f, 0, 0, 0); err == nil {

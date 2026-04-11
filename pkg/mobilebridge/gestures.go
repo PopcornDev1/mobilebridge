@@ -51,8 +51,23 @@ func buildTouchEvent(kind string, points []TouchPoint) TouchEventParams {
 	return TouchEventParams{Type: kind, TouchPoints: points}
 }
 
+// maxCoord is the upper bound we allow for touch coordinates. Real mobile
+// viewports top out well below this; anything larger is almost certainly a
+// caller bug (negative ints coerced to huge values, off-by-one, etc).
+const maxCoord = 100000
+
+func validCoord(x, y int) error {
+	if x < 0 || y < 0 || x > maxCoord || y > maxCoord {
+		return fmt.Errorf("mobilebridge: coord out of range: (%d, %d)", x, y)
+	}
+	return nil
+}
+
 // Tap sends a single-finger touchStart then touchEnd at (x, y).
 func Tap(p messageSender, x, y int) error {
+	if err := validCoord(x, y); err != nil {
+		return err
+	}
 	points := []TouchPoint{{X: float64(x), Y: float64(y), ID: 0, Force: 1}}
 	if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", points)); err != nil {
 		return err
@@ -62,8 +77,11 @@ func Tap(p messageSender, x, y int) error {
 
 // LongPress sends a touchStart, waits durationMs, then sends a touchEnd.
 func LongPress(p messageSender, x, y, durationMs int) error {
-	if durationMs < 0 {
-		durationMs = 0
+	if err := validCoord(x, y); err != nil {
+		return err
+	}
+	if durationMs <= 0 {
+		return fmt.Errorf("mobilebridge: long press duration must be > 0, got %d", durationMs)
 	}
 	points := []TouchPoint{{X: float64(x), Y: float64(y), ID: 0, Force: 1}}
 	if err := p.sendUpstream("Input.dispatchTouchEvent", buildTouchEvent("touchStart", points)); err != nil {
@@ -77,6 +95,12 @@ func LongPress(p messageSender, x, y, durationMs int) error {
 // durationMs milliseconds, interpolating with a fixed number of move events.
 func Swipe(p messageSender, fromX, fromY, toX, toY, durationMs int) error {
 	const steps = 10
+	if err := validCoord(fromX, fromY); err != nil {
+		return err
+	}
+	if err := validCoord(toX, toY); err != nil {
+		return err
+	}
 	if durationMs < 0 {
 		durationMs = 0
 	}
