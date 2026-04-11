@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 const sampleMemInfo = `MemTotal:        5879072 kB
@@ -130,6 +131,65 @@ func TestEnrich_ParseFailureCounted(t *testing.T) {
 	}
 	if d.AndroidVersion != "" || d.SDKLevel != 0 || d.RAM_MB != 0 || d.BatteryPercent != 0 {
 		t.Errorf("no fields should be populated: %+v", d)
+	}
+}
+
+// TestEnrich_HungCmdDoesntBlockOthers verifies that if one of the four adb
+// shell lookups blocks, the per-call timeout fires and the other three still
+// populate their fields. The whole Enrich must complete well under the sum
+// of (all four individually hung) timeouts.
+func TestEnrich_HungCmdDoesntBlockOthers(t *testing.T) {
+	orig := commandRunner
+	origTimeout := enrichPerCallTimeout
+	t.Cleanup(func() {
+		commandRunner = orig
+		enrichPerCallTimeout = origTimeout
+	})
+	enrichPerCallTimeout = 200 * time.Millisecond
+
+	commandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		full := strings.Join(args, " ")
+		switch {
+		case strings.Contains(full, "getprop ro.build.version.release"):
+			return []byte("14\n"), nil
+		case strings.Contains(full, "getprop ro.build.version.sdk"):
+			// Block until the per-call ctx is cancelled.
+			<-ctx.Done()
+			return nil, ctx.Err()
+		case strings.Contains(full, "cat /proc/meminfo"):
+			return []byte(sampleMemInfo), nil
+		case strings.Contains(full, "dumpsys battery"):
+			return []byte(sampleDumpsysBattery), nil
+		}
+		return nil, nil
+	}
+
+	d := &Device{Serial: "R58N12ABCDE"}
+	start := time.Now()
+	err := d.Enrich(context.Background())
+	elapsed := time.Since(start)
+
+	// Because three of four lookups succeed, Enrich should return nil (okAny
+	// is true) even though the fourth timed out.
+	if err != nil {
+		t.Fatalf("Enrich returned %v; expected nil since three fields succeeded", err)
+	}
+	// Must finish within ~6s (well under the 5s default even with scheduling
+	// jitter — we lowered the per-call timeout to 200ms for this test).
+	if elapsed > 6*time.Second {
+		t.Errorf("Enrich took %v; per-call timeout must unblock siblings faster", elapsed)
+	}
+	if d.AndroidVersion != "14" {
+		t.Errorf("AndroidVersion = %q, want 14", d.AndroidVersion)
+	}
+	if d.RAM_MB != 5741 {
+		t.Errorf("RAM_MB = %d, want 5741", d.RAM_MB)
+	}
+	if d.BatteryPercent != 87 {
+		t.Errorf("BatteryPercent = %d, want 87", d.BatteryPercent)
+	}
+	if d.SDKLevel != 0 {
+		t.Errorf("SDKLevel = %d, want 0 (hung call must not fill it)", d.SDKLevel)
 	}
 }
 

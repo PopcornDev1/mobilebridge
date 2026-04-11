@@ -6,7 +6,15 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+// enrichPerCallTimeout bounds each individual adb shell lookup performed by
+// Enrich. A single hung call (locked screen, adb daemon wedge) must not stall
+// the other three reads, so each goroutine gets its own child context with
+// this deadline. Exposed as a package-level var so tests can shrink it.
+var enrichPerCallTimeout = 5 * time.Second
 
 // Enrich fills in AndroidVersion, SDKLevel, RAM_MB and BatteryPercent by
 // shelling out to the device via adb. Individual lookups that fail are left
@@ -24,72 +32,112 @@ func (d *Device) Enrich(ctx context.Context) error {
 	if d.Serial == "" {
 		return errors.New("mobilebridge: empty serial")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	var firstErr error
-	var okAny bool
-	record := func(err error) {
-		if err == nil {
+	// Run the four adb reads in parallel with a per-call timeout so a single
+	// hung shell can't stall the others. Each worker stores its parsed value
+	// under mu and folds any error into firstErr via record().
+	var (
+		mu       sync.Mutex
+		firstErr error
+		okAny    bool
+	)
+	record := func(ok bool, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if ok {
 			okAny = true
 			return
 		}
-		if firstErr == nil {
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 
-	// Android version (e.g. "14").
-	if out, err := commandRunner(ctx, adbPath, "-s", d.Serial, "shell",
-		"getprop", "ro.build.version.release"); err == nil {
-		raw := strings.TrimSpace(string(out))
-		if raw != "" {
-			d.AndroidVersion = raw
-			okAny = true
-		} else {
-			record(errors.New("parse android version: empty getprop output"))
+	runShell := func(label string, shellArgs []string, parse func([]byte) (bool, error)) {
+		cctx, cancel := context.WithTimeout(ctx, enrichPerCallTimeout)
+		defer cancel()
+		args := append([]string{"-s", d.Serial, "shell"}, shellArgs...)
+		out, err := commandRunner(cctx, adbPath, args...)
+		if err != nil {
+			record(false, fmt.Errorf("%s: %w", label, err))
+			return
 		}
-	} else {
-		record(err)
+		ok, perr := parse(out)
+		if !ok {
+			record(false, fmt.Errorf("%s: %w", label, perr))
+			return
+		}
+		record(true, nil)
 	}
 
-	// SDK level (e.g. "34").
-	if out, err := commandRunner(ctx, adbPath, "-s", d.Serial, "shell",
-		"getprop", "ro.build.version.sdk"); err == nil {
-		raw := strings.TrimSpace(string(out))
-		if n, perr := strconv.Atoi(raw); perr == nil {
-			d.SDKLevel = n
-			okAny = true
-		} else {
-			record(fmt.Errorf("parse sdk level %q: %w", raw, perr))
-		}
-	} else {
-		record(err)
-	}
+	var wg sync.WaitGroup
+	wg.Add(4)
 
-	// RAM via /proc/meminfo.
-	if out, err := commandRunner(ctx, adbPath, "-s", d.Serial, "shell",
-		"cat", "/proc/meminfo"); err == nil {
-		d.RAM_MB = parseMemTotalMB(string(out))
-		if d.RAM_MB > 0 {
-			okAny = true
-		} else {
-			record(errors.New("parse meminfo: no MemTotal line"))
-		}
-	} else {
-		record(err)
-	}
+	go func() {
+		defer wg.Done()
+		runShell("android version", []string{"getprop", "ro.build.version.release"},
+			func(out []byte) (bool, error) {
+				raw := strings.TrimSpace(string(out))
+				if raw == "" {
+					return false, errors.New("parse android version: empty getprop output")
+				}
+				mu.Lock()
+				d.AndroidVersion = raw
+				mu.Unlock()
+				return true, nil
+			})
+	}()
 
-	// Battery level via dumpsys battery.
-	if out, err := commandRunner(ctx, adbPath, "-s", d.Serial, "shell",
-		"dumpsys", "battery"); err == nil {
-		if pct, ok := parseBatteryLevel(string(out)); ok {
-			d.BatteryPercent = pct
-			okAny = true
-		} else {
-			record(errors.New("parse dumpsys battery: no level line"))
-		}
-	} else {
-		record(err)
-	}
+	go func() {
+		defer wg.Done()
+		runShell("sdk level", []string{"getprop", "ro.build.version.sdk"},
+			func(out []byte) (bool, error) {
+				raw := strings.TrimSpace(string(out))
+				n, perr := strconv.Atoi(raw)
+				if perr != nil {
+					return false, fmt.Errorf("parse sdk level %q: %w", raw, perr)
+				}
+				mu.Lock()
+				d.SDKLevel = n
+				mu.Unlock()
+				return true, nil
+			})
+	}()
+
+	go func() {
+		defer wg.Done()
+		runShell("ram meminfo", []string{"cat", "/proc/meminfo"},
+			func(out []byte) (bool, error) {
+				mb := parseMemTotalMB(string(out))
+				if mb <= 0 {
+					return false, errors.New("parse meminfo: no MemTotal line")
+				}
+				mu.Lock()
+				d.RAM_MB = mb
+				mu.Unlock()
+				return true, nil
+			})
+	}()
+
+	go func() {
+		defer wg.Done()
+		runShell("battery level", []string{"dumpsys", "battery"},
+			func(out []byte) (bool, error) {
+				pct, ok := parseBatteryLevel(string(out))
+				if !ok {
+					return false, errors.New("parse dumpsys battery: no level line")
+				}
+				mu.Lock()
+				d.BatteryPercent = pct
+				mu.Unlock()
+				return true, nil
+			})
+	}()
+
+	wg.Wait()
 
 	if !okAny {
 		if firstErr != nil {
