@@ -4,27 +4,28 @@ import (
 	"context"
 	"os/exec"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // scriptedRunner returns a commandRunner that yields consecutive stdout
 // strings from a script on each invocation. After the script is exhausted
-// the last entry is repeated.
-func scriptedRunner(script []string) (func(ctx context.Context, name string, args ...string) ([]byte, error), *int32) {
-	var idx int32
+// the last entry is repeated. The returned *int is the call counter,
+// guarded by the same mutex as the runner itself.
+func scriptedRunner(script []string) (func(ctx context.Context, name string, args ...string) ([]byte, error), *int) {
 	var mu sync.Mutex
-	return func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	idx := 0
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		mu.Lock()
 		defer mu.Unlock()
-		i := int(atomic.LoadInt32(&idx))
+		i := idx
 		if i >= len(script) {
 			i = len(script) - 1
 		}
-		atomic.AddInt32(&idx, 1)
+		idx++
 		return []byte(script[i]), nil
-	}, &idx
+	}
+	return runner, &idx
 }
 
 func withStubbedADB(t *testing.T, runner func(ctx context.Context, name string, args ...string) ([]byte, error)) {
@@ -61,6 +62,28 @@ func collectEvents(t *testing.T, ch <-chan DeviceEvent, want int, timeout time.D
 	return got
 }
 
+// drainUntilClosed reads from ch until it is closed or the timeout fires,
+// so the WatchDevices goroutine (which closes the channel on ctx cancel)
+// has definitely exited before the test's t.Cleanup swaps commandRunner
+// back. Returns all observed events.
+func drainUntilClosed(t *testing.T, ch <-chan DeviceEvent, timeout time.Duration) []DeviceEvent {
+	t.Helper()
+	var out []DeviceEvent
+	deadline := time.After(timeout)
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+		case <-deadline:
+			t.Error("drainUntilClosed: channel not closed within timeout")
+			return out
+		}
+	}
+}
+
 // TestWatchDevices_NoDuplicateAdds feeds the same device across multiple
 // ticks and asserts we emit exactly one Added event, not one per tick.
 func TestWatchDevices_NoDuplicateAdds(t *testing.T) {
@@ -75,24 +98,16 @@ func TestWatchDevices_NoDuplicateAdds(t *testing.T) {
 		t.Fatalf("watch: %v", err)
 	}
 
-	// Collect for a few ticks then cancel.
+	// Collect for a few ticks then cancel and drain until the producer
+	// goroutine closes the channel.
 	time.Sleep(40 * time.Millisecond)
 	cancel()
 
+	events := drainUntilClosed(t, ch, 500*time.Millisecond)
 	var addedCount int
-	drainDeadline := time.After(200 * time.Millisecond)
-drain:
-	for {
-		select {
-		case ev, ok := <-ch:
-			if !ok {
-				break drain
-			}
-			if ev.Type == DeviceAdded && ev.Device.Serial == "SERIAL_A" {
-				addedCount++
-			}
-		case <-drainDeadline:
-			break drain
+	for _, ev := range events {
+		if ev.Type == DeviceAdded && ev.Device.Serial == "SERIAL_A" {
+			addedCount++
 		}
 	}
 	if addedCount != 1 {
@@ -128,6 +143,8 @@ func TestWatchDevices_ProperlyHandlesRemoves(t *testing.T) {
 	if events[2].Type != DeviceAdded || events[2].Device.Serial != "SERIAL_A" {
 		t.Errorf("events[2] = %+v, want Added SERIAL_A", events[2])
 	}
+	cancel()
+	drainUntilClosed(t, ch, 500*time.Millisecond)
 }
 
 // TestWatchDevices_StateChange feeds a device that transitions from
@@ -161,6 +178,8 @@ func TestWatchDevices_StateChange(t *testing.T) {
 	if events[2].Type != DeviceAdded || events[2].Device.State != "device" {
 		t.Errorf("events[2] = %+v want Added/device", events[2])
 	}
+	cancel()
+	drainUntilClosed(t, ch, 500*time.Millisecond)
 }
 
 // TestWatchDevices_CtxCancellation asserts the output channel is closed
@@ -181,20 +200,5 @@ func TestWatchDevices_CtxCancellation(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 	cancel()
-	select {
-	case _, ok := <-ch:
-		if ok {
-			// A pending event is fine; check the next recv closes.
-			select {
-			case _, ok := <-ch:
-				if ok {
-					t.Errorf("expected channel closed, got another event")
-				}
-			case <-time.After(200 * time.Millisecond):
-				t.Error("channel not closed within 200ms after cancel")
-			}
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Error("channel not closed within 200ms after cancel")
-	}
+	drainUntilClosed(t, ch, 500*time.Millisecond)
 }
