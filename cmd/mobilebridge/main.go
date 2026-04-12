@@ -76,10 +76,10 @@ func runBridge(device string, port int, autoRestart bool, screenRecord string, l
 		}
 		log.Printf("using device %s (attempt %d)", serial, attempt)
 
-		proxy, err := mobilebridge.NewProxy(context.Background(), serial, port)
+		session, err := mobilebridge.StartAttachedServer(context.Background(), serial, fmt.Sprintf("127.0.0.1:%d", port))
 		if err != nil {
 			if autoRestart {
-				log.Printf("new proxy failed: %v (retrying in 2s)", err)
+				log.Printf("start bridge failed: %v (retrying in 2s)", err)
 				select {
 				case <-sigCh:
 					return
@@ -87,23 +87,12 @@ func runBridge(device string, port int, autoRestart bool, screenRecord string, l
 					continue
 				}
 			}
-			log.Fatalf("new proxy: %v", err)
-		}
-
-		srv := mobilebridge.NewServer(serial, fmt.Sprintf("127.0.0.1:%d", port))
-		if err := srv.Start(); err != nil {
-			_ = proxy.Close()
-			log.Fatalf("start server: %v", err)
-		}
-		if err := srv.RunWithProxy(proxy); err != nil {
-			_ = srv.Stop()
-			_ = proxy.Close()
-			log.Fatalf("wire proxy: %v", err)
+			log.Fatalf("start bridge: %v", err)
 		}
 		log.Printf("mobilebridge listening on http://127.0.0.1:%d", port)
 
 		if screenRecord != "" {
-			if err := proxy.StartScreenRecording(context.Background(), screenRecord); err != nil {
+			if err := session.Proxy.StartScreenRecording(context.Background(), screenRecord); err != nil {
 				log.Printf("screen record start failed: %v", err)
 			} else {
 				log.Printf("recording screen to %s (will pull on shutdown)", screenRecord)
@@ -123,19 +112,17 @@ func runBridge(device string, port int, autoRestart bool, screenRecord string, l
 			log.Printf("shutting down")
 			if screenRecord != "" {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				if err := proxy.StopScreenRecording(ctx); err != nil {
+				if err := session.Proxy.StopScreenRecording(ctx); err != nil {
 					log.Printf("stop screen record: %v", err)
 				} else {
 					log.Printf("pulled screen recording to %s", screenRecord)
 				}
 				cancel()
 			}
-			_ = srv.Stop()
-			_ = proxy.Close()
+			_ = session.Close()
 			return
-		case <-proxy.Done():
-			_ = srv.Stop()
-			_ = proxy.Close()
+		case <-session.Done():
+			_ = session.Close()
 			if !autoRestart {
 				log.Printf("upstream dropped; exiting (pass --auto-restart to keep retrying)")
 				return

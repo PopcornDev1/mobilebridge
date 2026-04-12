@@ -1,7 +1,9 @@
 package mobilebridge
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +12,68 @@ import (
 	"testing"
 	"time"
 )
+
+func TestStartAttachedServerWithADBPort(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"id":"X","webSocketDebuggerUrl":"ws://127.0.0.1:9999/devtools/page/X"}]`)
+	}))
+	defer upstream.Close()
+
+	upHost := strings.TrimPrefix(upstream.URL, "http://")
+	upPort := 0
+	if _, err := fmtSscanfPort(upHost, &upPort); err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+	serverPort, err := freeTCPPort()
+	if err != nil {
+		t.Fatalf("free server port: %v", err)
+	}
+
+	oldNewProxy := newProxyForAttachedServer
+	defer func() { newProxyForAttachedServer = oldNewProxy }()
+	newProxyForAttachedServer = func(ctx context.Context, serial string, localPort int) (*Proxy, error) {
+		if serial != "fake-serial" {
+			t.Fatalf("serial = %q, want fake-serial", serial)
+		}
+		if localPort != 4567 {
+			t.Fatalf("adb port = %d, want 4567", localPort)
+		}
+		return &Proxy{
+			localPort: upPort,
+			closed:    make(chan struct{}),
+			done:      make(chan struct{}),
+		}, nil
+	}
+
+	addr := fmt.Sprintf("127.0.0.1:%d", serverPort)
+	session, err := StartAttachedServerWithADBPort(context.Background(), "fake-serial", 4567, addr)
+	if err != nil {
+		t.Fatalf("start attached server: %v", err)
+	}
+	if session.Endpoint != "http://"+addr {
+		t.Fatalf("endpoint = %q, want http://%s", session.Endpoint, addr)
+	}
+
+	resp, err := http.Get(session.Endpoint + "/json/list")
+	if err != nil {
+		t.Fatalf("get list: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case <-session.Done():
+	default:
+		t.Fatalf("session done channel was not closed")
+	}
+}
 
 // TestJsonListRewrite spins up a fake upstream Chrome that serves a
 // synthetic /json/list, wires it into a Server via RunWithProxy, and
