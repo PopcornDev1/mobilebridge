@@ -16,7 +16,7 @@ On top of standard CDP, mobilebridge adds synthetic **touch gesture** commands (
   │   - CDP WebSocket    │
   │   - Touch gestures   │
   └──────────────────────┘
-         │  adb -s <serial> forward tcp:<port> localabstract:chrome_devtools_remote
+         │  adb -s <serial> forward tcp:<adb-port> localabstract:chrome_devtools_remote
          ▼
   Android Chrome on device
 ```
@@ -110,9 +110,10 @@ Standard CDP has `Input.dispatchTouchEvent`, but it's fiddly to drive interactiv
 
 ```go
 ctx := context.Background()
-p, _ := mobilebridge.NewProxy(ctx, "R58N12ABCDE", 9222)
-defer p.Close()
+session, _ := mobilebridge.StartAttachedServer(ctx, "R58N12ABCDE", "127.0.0.1:9222")
+defer session.Close()
 
+p := session.Proxy
 p.Tap(ctx, 200, 400)
 p.Swipe(ctx, 500, 1200, 500, 300, 300)         // scroll up
 p.Pinch(ctx, 540, 960, 0.5)                    // pinch out
@@ -165,25 +166,26 @@ or via the CLI: `mobilebridge --port 9222 --screenrecord /tmp/run.mp4`.
 
 ## Proxy lifecycle
 
-A `*Proxy` owns one upstream CDP websocket plus the adb forward that
-connects to it. The usual shape is:
+An `*AttachedServer` owns the public HTTP server plus the `*Proxy` that
+connects to the Android devtools socket. The usual shape is:
 
 ```go
 ctx := context.Background()
-p, err := mobilebridge.NewProxy(ctx, serial, 9222)
+session, err := mobilebridge.StartAttachedServer(ctx, serial, "127.0.0.1:9222")
 if err != nil { log.Fatal(err) }
-defer p.Close()
-
-// p.Serve(ctx, downstreamWS) is driven by the HTTP handler wired up via
-// Server.RunWithProxy. Only one downstream client at a time.
+defer session.Close()
 
 select {
 case <-ctx.Done():
     // shut down
-case <-p.Done():
+case <-session.Done():
     // upstream permanently lost (reconnect exhausted backoff) — rebuild
 }
 ```
+
+Lower-level callers can still compose `NewProxy`, `NewServer`, and
+`Server.RunWithProxy` directly. Use a different ADB-forward port from the
+public server port when doing that manually.
 
 `Done()` returns a channel closed either by `Close()` or when `reconnect`
 gives up after its escalating backoff. Before that, transient ADB forward
