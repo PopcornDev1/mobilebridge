@@ -252,7 +252,13 @@ func (s *Server) RunWithProxy(p *Proxy) error {
 		s.listCacheMu.Unlock()
 		rec := &cachingResponseWriter{ResponseWriter: w}
 		listHandler(rec, r)
-		if rec.status == 0 || rec.status == http.StatusOK {
+		// Only cache a verified 200. Upstream 5xx bodies are transient
+		// errors and must not be served to subsequent clients for the
+		// next jsonListCacheTTL window. forwardJSON always calls
+		// WriteHeader with upstream's status, so rec.status == 0 means
+		// the handler errored out before writing anything and also
+		// should not be cached.
+		if rec.status == http.StatusOK {
 			s.listCacheMu.Lock()
 			s.listCacheBuf = rec.buf
 			s.listCacheAt = time.Now()
@@ -307,7 +313,11 @@ func (c *cachingResponseWriter) WriteHeader(code int) {
 }
 
 func (c *cachingResponseWriter) Write(b []byte) (int, error) {
-	c.buf = append(c.buf, b...)
+	// Only buffer the body if we're going to actually cache it. Errors
+	// (5xx, 4xx) pass through to the client without being stored.
+	if c.status == 0 || c.status == http.StatusOK {
+		c.buf = append(c.buf, b...)
+	}
 	return c.ResponseWriter.Write(b)
 }
 

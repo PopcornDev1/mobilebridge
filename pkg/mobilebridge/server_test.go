@@ -141,6 +141,54 @@ func TestJsonListCache_HitsWithin500ms(t *testing.T) {
 	}
 }
 
+// TestJsonListCache_DoesNotCacheErrors verifies a non-200 upstream response
+// is not cached: a follow-up request must refetch upstream rather than
+// serving the cached error for up to jsonListCacheTTL.
+func TestJsonListCache_DoesNotCacheErrors(t *testing.T) {
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.Error(w, "upstream down", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+
+	upHost := strings.TrimPrefix(upstream.URL, "http://")
+	upPort := 0
+	if _, err := fmtSscanfPort(upHost, &upPort); err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+	p := &Proxy{localPort: upPort}
+	s := NewServer("fake-serial", "127.0.0.1:9225")
+	if err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+	if err := s.RunWithProxy(p); err != nil {
+		t.Fatalf("wire: %v", err)
+	}
+
+	// Three hits; each should miss cache because 503 is not cacheable.
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get("http://127.0.0.1:9225/json/list")
+		if err != nil {
+			t.Fatalf("get %d: %v", i, err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Errorf("error responses were cached: upstream hits = %d, want 3", got)
+	}
+
+	// Cache buffer must remain empty.
+	s.listCacheMu.Lock()
+	cached := s.listCacheBuf
+	s.listCacheMu.Unlock()
+	if cached != nil {
+		t.Errorf("cache buffer populated with error body: %q", cached)
+	}
+}
+
 // TestJsonListCache_InvalidatedOnDeviceChange ensures RunWithProxy wipes
 // the /json/list cache so the first request after attaching a new device's
 // proxy always refetches upstream instead of serving the previous device's
