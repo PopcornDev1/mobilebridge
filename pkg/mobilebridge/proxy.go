@@ -279,9 +279,14 @@ func (p *Proxy) sendUpstream(method string, params any) error {
 	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	// Hold upstreamMu.RLock() for the full WriteMessage duration so that
+	// reconnect() (which takes the write side) cannot nil and Close() the
+	// conn out from under an in-flight write. Without this, a concurrent
+	// reconnect-caused old.Close() could race the write and corrupt the
+	// gorilla/websocket send state.
 	p.upstreamMu.RLock()
+	defer p.upstreamMu.RUnlock()
 	conn := p.upstream
-	p.upstreamMu.RUnlock()
 	if conn == nil {
 		return errors.New("mobilebridge: proxy not connected")
 	}
@@ -607,13 +612,15 @@ var reconnectBackoff = []time.Duration{
 }
 
 // writeUpstream serializes a raw text frame write to the upstream WebSocket
-// under writeMu, safely reading p.upstream under upstreamMu.
+// under writeMu. upstreamMu.RLock() is held for the duration of the
+// WriteMessage call so reconnect() (which takes the write lock) cannot
+// Close() the conn out from under a concurrent writer.
 func (p *Proxy) writeUpstream(data []byte) error {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
 	p.upstreamMu.RLock()
+	defer p.upstreamMu.RUnlock()
 	conn := p.upstream
-	p.upstreamMu.RUnlock()
 	if conn == nil {
 		return errors.New("mobilebridge: upstream nil")
 	}

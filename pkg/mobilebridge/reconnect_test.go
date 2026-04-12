@@ -525,6 +525,81 @@ func TestProxy_ReaderInitiatedReconnect(t *testing.T) {
 	}
 }
 
+// TestWriteUpstream_NoRaceWithReconnect hammers writeUpstream from one
+// goroutine while another goroutine repeatedly calls reconnect(). Under
+// -race any concurrent access to the gorilla conn (a write racing a
+// Close from reconnect) is reported as a data race, which was the MB6
+// bug: writeUpstream snapshotted conn under RLock, then released the
+// lock before calling WriteMessage, so reconnect() could Close() the
+// same conn mid-write.
+func TestWriteUpstream_NoRaceWithReconnect(t *testing.T) {
+	origBackoff := reconnectBackoff
+	reconnectBackoff = []time.Duration{1 * time.Millisecond}
+	t.Cleanup(func() { reconnectBackoff = origBackoff })
+
+	origRunner := commandRunner
+	commandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { commandRunner = origRunner })
+
+	up := newUpstreamRecorder()
+	defer up.Close()
+	jsonSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"Browser":"Chrome/stub","webSocketDebuggerUrl":%q}`, up.WSURL())
+	}))
+	defer jsonSrv.Close()
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(jsonSrv.URL, "http://"))
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	conn, _, err := websocket.DefaultDialer.Dial(up.WSURL(), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	p := &Proxy{
+		serial:     "STUB",
+		localPort:  port,
+		remoteSock: "chrome_devtools_remote",
+		upstream:   conn,
+		closed:     make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = p.writeUpstream([]byte(`{"id":1,"method":"Runtime.evaluate"}`))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = p.reconnect()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	close(done)
+	wg.Wait()
+	_ = p.Close()
+}
+
 // TestReconnect_ReaderSurvivesWidenedSwapWindow installs a hook that sleeps
 // between clearing the upstream conn and starting the dial loop, widening
 // the window in which a reader could observe the swap. The reader pump must
