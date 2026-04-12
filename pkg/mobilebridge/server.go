@@ -376,9 +376,21 @@ func rewriteEntry(entry map[string]interface{}, publicHost string) {
 // leaving scheme/path/query intact. Uses net/url.Parse so IPv6 literals like
 // ws://[::1]:9999/devtools/page/X (whose brackets contain colons) parse
 // correctly instead of breaking the naive string splice.
+//
+// Security: the original URL's scheme is always preserved. If the upstream
+// URL is wss://, rewriting to publicHost would silently downgrade clients
+// to plain ws:// against our HTTP listener (we don't terminate TLS in this
+// MVP), so wss:// URLs are returned unchanged — clients will fail loudly
+// against the original upstream host instead of accidentally TLS-handshaking
+// against a plaintext server.
 func rewriteWSURL(raw, publicHost string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" {
+		return raw
+	}
+	if u.Scheme != "ws" {
+		// wss:// or any non-ws scheme: leave untouched. Rewriting would
+		// downgrade TLS clients to a plaintext listener.
 		return raw
 	}
 	u.Host = publicHost

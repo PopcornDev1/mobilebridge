@@ -70,6 +70,24 @@ func TestJsonListRewrite(t *testing.T) {
 	}
 }
 
+// TestRewriteWSURL_PreservesWss verifies that a wss:// upstream URL is NOT
+// silently downgraded to ws:// when rewritten against a plaintext HTTP
+// listener. The correct behavior is to return the URL unchanged so TLS
+// clients fail loudly rather than accidentally handshaking against a
+// plaintext server.
+func TestRewriteWSURL_PreservesWss(t *testing.T) {
+	in := "wss://upstream.example.com:443/devtools/page/ABC"
+	out := rewriteWSURL(in, "127.0.0.1:9222")
+	if out != in {
+		t.Errorf("wss:// URL was rewritten (possible downgrade): got %q want %q", out, in)
+	}
+	// Sanity: plain ws:// still gets rewritten.
+	out = rewriteWSURL("ws://upstream:9999/devtools/page/ABC", "127.0.0.1:9222")
+	if out != "ws://127.0.0.1:9222/devtools/page/ABC" {
+		t.Errorf("ws:// URL not rewritten: got %q", out)
+	}
+}
+
 func TestRewriteDevtoolsJSONUnknownBody(t *testing.T) {
 	body := []byte("not json at all")
 	if out := rewriteDevtoolsJSON(body, "127.0.0.1:9222"); string(out) != "not json at all" {
