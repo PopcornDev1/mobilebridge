@@ -134,11 +134,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNew(w http.ResponseWriter, r *http.Request) {
-	url := "/json/new"
+	relPath := "/json/new"
 	if q := r.URL.Query().Get("url"); q != "" {
-		url += "?" + r.URL.RawQuery
+		relPath += "?" + r.URL.RawQuery
 	}
-	s.proxyJSON(w, url)
+	s.proxyJSON(w, relPath)
 }
 
 // proxyJSON forwards a GET to the local ADB-forwarded port (set up by the
