@@ -645,18 +645,33 @@ func (p *Proxy) ensureReconnect() error {
 // restart, device sleep). Returns the final error if all attempts fail.
 //
 // Callers should prefer ensureReconnect() which deduplicates concurrent
-// reader/writer invocations; reconnect() itself always runs a full cycle.
+// reader/writer invocations; reconnect() itself is ALSO safe to call from
+// multiple goroutines — if another reconnect is already in flight, this
+// call waits for it and returns its result instead of starting a second
+// cycle. Without that, two racing direct callers could both exhaust the
+// backoff and one could call signalDone() while the other installed a
+// healthy upstream, leaving Done() permanently closed on a live proxy.
 //
 // While reconnect runs, p.reconnectGate is non-nil and the peer goroutine
 // in Serve() (reader or writer) will block on it after observing its own
 // I/O error, so the peer resumes on the new connection once the swap
 // succeeds.
 func (p *Proxy) reconnect() error {
+	// Serialize: if another reconnect is already running, piggy-back on it
+	// instead of starting a second cycle in parallel.
+	gate := make(chan struct{})
+	p.upstreamMu.Lock()
+	if existing := p.reconnectGate; existing != nil {
+		p.upstreamMu.Unlock()
+		<-existing
+		p.upstreamMu.RLock()
+		err := p.reconnectErr
+		p.upstreamMu.RUnlock()
+		return err
+	}
 	// Open the gate so the reader knows to wait for us instead of tearing
 	// the whole Serve loop down. Close the old conn to unblock any
 	// in-flight ReadMessage.
-	gate := make(chan struct{})
-	p.upstreamMu.Lock()
 	p.reconnectGate = gate
 	p.reconnectErr = nil
 	old := p.upstream

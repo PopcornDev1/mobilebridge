@@ -536,6 +536,76 @@ func TestProxy_ReaderInitiatedReconnect(t *testing.T) {
 	}
 }
 
+// TestReconnect_Serialized spawns several goroutines all calling reconnect()
+// simultaneously and verifies that only one actually runs the reconnect
+// cycle. The others must observe the in-flight gate and return its result,
+// otherwise a "first caller exhausts backoff and signals Done()" + "second
+// caller succeeds" race would leave a live proxy permanently marked done.
+func TestReconnect_Serialized(t *testing.T) {
+	origBackoff := reconnectBackoff
+	reconnectBackoff = []time.Duration{5 * time.Millisecond}
+	t.Cleanup(func() { reconnectBackoff = origBackoff })
+
+	origRunner := commandRunner
+	commandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { commandRunner = origRunner })
+
+	up := newUpstreamRecorder()
+	defer up.Close()
+
+	var hits int32
+	jsonSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		// Hold briefly so concurrent callers pile up on the in-flight gate.
+		time.Sleep(20 * time.Millisecond)
+		fmt.Fprintf(w, `{"Browser":"Chrome/stub","webSocketDebuggerUrl":%q}`, up.WSURL())
+	}))
+	defer jsonSrv.Close()
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(jsonSrv.URL, "http://"))
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	p := &Proxy{
+		serial:     "STUB",
+		localPort:  port,
+		remoteSock: "chrome_devtools_remote",
+		closed:     make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+
+	const N = 5
+	var wg sync.WaitGroup
+	errs := make([]error, N)
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			errs[i] = p.reconnect()
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("reconnect[%d] returned %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("want 1 /json/version hit (single in-flight reconnect), got %d", got)
+	}
+	// Done() must NOT be closed; the proxy reconnected cleanly.
+	select {
+	case <-p.Done():
+		t.Error("Done() was closed despite a successful reconnect")
+	default:
+	}
+	_ = p.Close()
+}
+
 // TestProxyReconnect_ReaderResumes verifies that when reconnect() swaps in a
 // fresh upstream, the Serve reader goroutine picks up the new connection
 // instead of staying blocked on the old (closed) one. The bug before M2 was
