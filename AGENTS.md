@@ -18,6 +18,12 @@ When running unattended:
 - Keep the README accurate — it's the entire public docs surface.
 - If a task requires pulling in a private detail to do it well, **skip the task** rather than leak anything.
 
+## Coordination and local tooling
+
+- Linear is the shared execution tracker for the VulpineOS ecosystem. Use the `VulpineOS` workspace, product/type/source labels, and link commits in issue comments when closing work.
+- Codex has a persistent local Playwright MCP at `http://localhost:8931/mcp` for browser navigation, snapshots, console/network inspection, and screenshots. It writes artifacts to `~/.codex/mcp-output/playwright` and omits inline image payloads to reduce token usage.
+- Keep public issue comments and docs generic for this repo: Android bridge details are fine; private implementation details are not.
+
 ## Code layout
 
 - `cmd/mobilebridge/` — CLI entry point.
