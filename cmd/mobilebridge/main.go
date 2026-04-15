@@ -27,15 +27,16 @@ import (
 
 func main() {
 	var (
-		device       = flag.String("device", "", "device serial (auto-pick if empty and exactly one is attached)")
-		port         = flag.Int("port", 9222, "local TCP port for the CDP server")
-		list         = flag.Bool("list", false, "list attached devices and exit")
-		watch        = flag.Bool("watch", false, "continuously watch for device hotplug and log added/removed devices")
-		health       = flag.Bool("health", false, "print device + connection state and exit")
-		autoRestart  = flag.Bool("auto-restart", false, "if the upstream drops, auto-restart the bridge instead of exiting")
-		devices      = flag.Bool("devices", false, "print enriched device list (Android version, SDK, RAM, battery) and exit")
-		screenRecord = flag.String("screenrecord", "", "start `adb screenrecord` on server start and pull to this path on shutdown")
-		logcat       = flag.Bool("logcat", false, "after bridge start, print `adb logcat -d` filtered to Chrome processes")
+		device        = flag.String("device", "", "device serial (auto-pick if empty and exactly one is attached)")
+		port          = flag.Int("port", 9222, "local TCP port for the CDP server")
+		list          = flag.Bool("list", false, "list attached devices and exit")
+		watch         = flag.Bool("watch", false, "continuously watch for device hotplug and log added/removed devices")
+		health        = flag.Bool("health", false, "print device + connection state and exit")
+		autoRestart   = flag.Bool("auto-restart", false, "if the upstream drops, auto-restart the bridge instead of exiting")
+		devices       = flag.Bool("devices", false, "print enriched device list (Android version, SDK, RAM, battery) and exit")
+		screenRecord  = flag.String("screenrecord", "", "start `adb screenrecord` on server start and pull to this path on shutdown")
+		logcat        = flag.Bool("logcat", false, "after bridge start, print `adb logcat -d` filtered to Chrome processes")
+		workerControl = flag.String("worker-control", "", "run hosted worker control server on this addr instead of a single-device bridge")
 	)
 	flag.Parse()
 
@@ -58,6 +59,11 @@ func main() {
 	case *health:
 		if err := runHealth(*device); err != nil {
 			log.Fatalf("health: %v", err)
+		}
+		return
+	case *workerControl != "":
+		if err := runWorkerControl(*workerControl); err != nil {
+			log.Fatalf("worker control: %v", err)
 		}
 		return
 	}
@@ -135,6 +141,20 @@ func runBridge(device string, port int, autoRestart bool, screenRecord string, l
 			}
 		}
 	}
+}
+
+func runWorkerControl(addr string) error {
+	server := mobilebridge.NewWorkerControlServer(addr)
+	if err := server.Start(); err != nil {
+		return err
+	}
+	defer server.Stop()
+
+	log.Printf("mobilebridge worker control listening on http://%s", addr)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+	return nil
 }
 
 func runList() error {

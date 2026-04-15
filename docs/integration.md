@@ -120,7 +120,8 @@ an endpoint implementation detail.
 Recommended service shape:
 
 1. allocate or choose an Android device
-2. call `StartAttachedServer` in the worker process
+2. call `StartAttachedServer` in the worker process, or expose the hosted
+   worker-control API when the worker is managed remotely
 3. store the resulting `session.Endpoint` with the job/session record
 4. hand that endpoint to the browser automation worker
 5. close the attached server on job completion or worker shutdown
@@ -139,6 +140,26 @@ while `mobilebridge` owns only:
 - local CDP proxying
 - reconnect behavior
 - gesture extensions
+
+## Hosted worker-control pattern
+
+When the worker process is not the same process as the control plane,
+`mobilebridge` can expose a narrow HTTP control API instead:
+
+```bash
+mobilebridge --worker-control 127.0.0.1:7788
+```
+
+Current endpoints:
+
+- `POST /sessions` with `{ "device_id": "..." }`
+- `DELETE /sessions/{id}`
+- `POST /sessions/{id}/targets`
+- `GET /health`
+
+This lets a control plane such as `vulpine-api` keep session leases,
+tenant auth, and placement logic in one place while the worker host owns
+the actual ADB attach and local CDP bridge lifecycle.
 
 ## Failure handling
 

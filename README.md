@@ -107,6 +107,12 @@ Print enriched device information:
 mobilebridge --devices
 ```
 
+Run the hosted worker-control server for device-farm style allocation:
+
+```
+mobilebridge --worker-control 127.0.0.1:7788
+```
+
 ## CLI flags
 
 | Flag             | Description                                                       |
@@ -120,6 +126,7 @@ mobilebridge --devices
 | `--devices`      | Print an enriched device list (Android version, SDK, RAM, battery) and exit. |
 | `--screenrecord` | Start `adb screenrecord` on server start and pull the MP4 to this path on shutdown. |
 | `--logcat`       | After bridge start, dump `adb logcat -d` filtered to Chrome/WebView tags. |
+| `--worker-control` | Run the hosted worker control server for attach, release, and new-target actions instead of a single-device bridge. |
 
 ## Touch gestures
 
@@ -266,6 +273,25 @@ component inside larger device-farm or agent systems.
 
 For the VulpineOS extension-adapter pattern and the recommended hosted
 API worker shape, see [docs/integration.md](docs/integration.md).
+
+## Hosted worker control
+
+For hosted device-farm deployments, `mobilebridge` can also run a small
+worker-control API that allocates attached sessions on demand:
+
+```bash
+mobilebridge --worker-control 127.0.0.1:7788
+```
+
+That server currently exposes:
+
+- `POST /sessions` with `{ "device_id": "..." }`
+- `DELETE /sessions/{id}`
+- `POST /sessions/{id}/targets`
+- `GET /health`
+
+The intended caller is a higher-level control plane such as `vulpine-api`.
+It assumes trusted internal callers on the worker host or private network.
 
 ## Sentinel errors
 

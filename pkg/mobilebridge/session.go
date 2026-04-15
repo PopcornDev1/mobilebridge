@@ -19,6 +19,13 @@ type AttachedServer struct {
 	Proxy  *Proxy
 }
 
+func (a *AttachedServer) BrowserURL() string {
+	if a == nil {
+		return ""
+	}
+	return a.Endpoint
+}
+
 // StartAttachedServer starts a local CDP bridge for serial at addr. The
 // public HTTP server listens on addr while the ADB forward uses a separate
 // ephemeral localhost port.
