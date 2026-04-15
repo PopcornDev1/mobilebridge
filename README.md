@@ -4,6 +4,24 @@ A CDP (Chrome DevTools Protocol) bridge for Android Chrome. It lets any CDP clie
 
 On top of standard CDP, mobilebridge adds synthetic **touch gesture** commands (tap, swipe, pinch, long-press) that are translated to `Input.dispatchTouchEvent` calls so agents can interact with mobile-first web experiences properly.
 
+## Release status
+
+`mobilebridge` is the open-source Android device bridge in the VulpineOS
+stack. The v0.1 line is intentionally narrow:
+
+- Android only
+- one active downstream CDP client per proxied page
+- ADB-backed local forwarding
+- gesture helpers, reconnect handling, device enrichment, and recording
+
+It is designed to be useful both as:
+
+1. a standalone command-line bridge for local or hosted Android devices
+2. an embeddable Go package for VulpineOS or other CDP tooling
+
+For release notes, see [CHANGELOG.md](CHANGELOG.md). For the release
+checklist used for tags, see [RELEASING.md](RELEASING.md).
+
 ## What it does
 
 ```
@@ -71,6 +89,18 @@ Point any CDP client at `http://localhost:9222` exactly as you would for a local
 
 ```
 const browser = await puppeteer.connect({ browserURL: 'http://localhost:9222' });
+```
+
+Check device/socket readiness without starting the bridge:
+
+```
+mobilebridge --health --device R58N12ABCDE
+```
+
+Print enriched device information:
+
+```
+mobilebridge --devices
 ```
 
 ## CLI flags
@@ -191,6 +221,45 @@ public server port when doing that manually.
 gives up after its escalating backoff. Before that, transient ADB forward
 drops are recovered internally without tearing the Serve loop down.
 
+## Embedding in host processes
+
+If you are integrating mobilebridge into another Go service, the normal
+entrypoint is `StartAttachedServer`:
+
+```go
+ctx := context.Background()
+session, err := mobilebridge.StartAttachedServer(ctx, "R58N12ABCDE", "127.0.0.1:9222")
+if err != nil {
+	log.Fatal(err)
+}
+defer session.Close()
+
+resp, err := http.Get("http://127.0.0.1:9222/json/version")
+if err != nil {
+	log.Fatal(err)
+}
+defer resp.Body.Close()
+```
+
+If your host already owns ADB port assignment, use
+`StartAttachedServerWithADBPort`:
+
+```go
+session, err := mobilebridge.StartAttachedServerWithADBPort(
+	ctx,
+	"R58N12ABCDE",
+	4567,
+	"127.0.0.1:9222",
+)
+if err != nil {
+	log.Fatal(err)
+}
+defer session.Close()
+```
+
+This keeps the package usable both as a local CLI and as a bridge
+component inside larger device-farm or agent systems.
+
 ## Sentinel errors
 
 Callers can match specific failure classes with `errors.Is`:
@@ -258,6 +327,10 @@ goroutines and will catch regressions there only under `-race`:
 ```
 go test ./... -race
 ```
+
+The repo also includes repeated soak coverage for reconnect serialization,
+busy-session enforcement, and `/json/list` cache invalidation to catch
+edge-case regressions that single-shot tests can miss.
 
 For a real-device smoke test, plug in an authorized Android phone with
 Chrome open on any tab, then run the CLI against it end-to-end:
