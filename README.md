@@ -142,7 +142,7 @@ mobilebridge \
 | `--worker-heartbeat-url` | POST hosted worker heartbeats to a Vulpine API control plane endpoint. |
 | `--worker-id` | Stable worker identifier used in hosted worker heartbeats. |
 | `--worker-token` | Bearer token sent with hosted worker heartbeat requests. |
-| `--worker-control-token` | Bearer token required for hosted worker-control attach, release, and target requests. |
+| `--worker-control-token` | Bearer token required for hosted worker-control attach, release, target, and recording requests. |
 | `--worker-advertise-url` | Control-plane-reachable worker-control URL advertised in hosted heartbeats. |
 | `--worker-hostname` | Override the hostname reported in hosted worker heartbeats. |
 | `--worker-heartbeat-interval` | Interval between hosted worker heartbeats (default `15s`). |
@@ -308,6 +308,9 @@ That server currently exposes:
 - `POST /sessions` with `{ "device_id": "..." }`
 - `DELETE /sessions/{id}`
 - `POST /sessions/{id}/targets`
+- `POST /sessions/{id}/recording/start`
+- `POST /sessions/{id}/recording/stop`
+- `GET /recordings/{id}/content`
 - `GET /health`
 
 The intended caller is a higher-level control plane such as `vulpine-api`.

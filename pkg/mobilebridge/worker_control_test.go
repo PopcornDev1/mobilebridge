@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -14,6 +15,7 @@ type fakeWorkerAttachedSession struct {
 	browserURL string
 	done       chan struct{}
 	closed     bool
+	recording  string
 }
 
 func (f *fakeWorkerAttachedSession) BrowserURL() string { return f.browserURL }
@@ -27,6 +29,13 @@ func (f *fakeWorkerAttachedSession) Close() error {
 }
 
 func (f *fakeWorkerAttachedSession) Done() <-chan struct{} { return f.done }
+
+func (f *fakeWorkerAttachedSession) StartRecording(_ context.Context, outputPath string) error {
+	f.recording = outputPath
+	return os.WriteFile(outputPath, []byte("video"), 0600)
+}
+
+func (f *fakeWorkerAttachedSession) StopRecording(context.Context) error { return nil }
 
 func TestWorkerControlServer_AttachTargetRelease(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -234,5 +243,105 @@ func TestWorkerControlServer_Snapshot(t *testing.T) {
 	}
 	if len(snapshot.Devices) != 1 || !snapshot.Devices[0].Inspectable {
 		t.Fatalf("snapshot devices = %#v", snapshot.Devices)
+	}
+}
+
+func TestWorkerControlServer_RecordingFlow(t *testing.T) {
+	session := &fakeWorkerAttachedSession{
+		browserURL: "http://127.0.0.1:9222",
+		done:       make(chan struct{}),
+	}
+	server := NewWorkerControlServer("127.0.0.1:0")
+	server.startAttached = func(context.Context, string, string) (workerAttachedSession, error) {
+		return session, nil
+	}
+	server.newSessionID = func() string { return "mbw_test" }
+	if err := server.Start(); err != nil {
+		t.Fatalf("start worker control: %v", err)
+	}
+	defer server.Stop()
+
+	resp, err := http.Post("http://"+server.ListenAddr()+"/sessions", "application/json", bytes.NewBufferString(`{"device_id":"android-1"}`))
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Post("http://"+server.ListenAddr()+"/sessions/mbw_test/recording/start", "application/json", bytes.NewBuffer(nil))
+	if err != nil {
+		t.Fatalf("start recording: %v", err)
+	}
+	var started WorkerRecordingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&started); err != nil {
+		t.Fatalf("decode start: %v", err)
+	}
+	resp.Body.Close()
+	if started.RecordingID == "" {
+		t.Fatalf("start response = %#v", started)
+	}
+
+	resp, err = http.Post("http://"+server.ListenAddr()+"/sessions/mbw_test/recording/stop", "application/json", bytes.NewBuffer(nil))
+	if err != nil {
+		t.Fatalf("stop recording: %v", err)
+	}
+	var stopped WorkerRecordingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&stopped); err != nil {
+		t.Fatalf("decode stop: %v", err)
+	}
+	resp.Body.Close()
+	if stopped.SizeBytes == 0 {
+		t.Fatalf("stop response = %#v", stopped)
+	}
+
+	resp, err = http.Get("http://" + server.ListenAddr() + "/recordings/" + started.RecordingID + "/content")
+	if err != nil {
+		t.Fatalf("download recording: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("download status = %d", resp.StatusCode)
+	}
+}
+
+func TestWorkerControlServer_AllowsSecondRecordingAfterStop(t *testing.T) {
+	session := &fakeWorkerAttachedSession{
+		browserURL: "http://127.0.0.1:9222",
+		done:       make(chan struct{}),
+	}
+	server := NewWorkerControlServer("127.0.0.1:0")
+	server.startAttached = func(context.Context, string, string) (workerAttachedSession, error) {
+		return session, nil
+	}
+	server.newSessionID = func() string { return "mbw_test" }
+	if err := server.Start(); err != nil {
+		t.Fatalf("start worker control: %v", err)
+	}
+	defer server.Stop()
+
+	resp, err := http.Post("http://"+server.ListenAddr()+"/sessions", "application/json", bytes.NewBufferString(`{"device_id":"android-1"}`))
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	resp.Body.Close()
+
+	for i := 0; i < 2; i++ {
+		resp, err = http.Post("http://"+server.ListenAddr()+"/sessions/mbw_test/recording/start", "application/json", bytes.NewBuffer(nil))
+		if err != nil {
+			t.Fatalf("start recording %d: %v", i, err)
+		}
+		var started WorkerRecordingResponse
+		if err := json.NewDecoder(resp.Body).Decode(&started); err != nil {
+			t.Fatalf("decode start %d: %v", i, err)
+		}
+		resp.Body.Close()
+		if started.RecordingID == "" {
+			t.Fatalf("start response %d = %#v", i, started)
+		}
+
+		resp, err = http.Post("http://"+server.ListenAddr()+"/sessions/mbw_test/recording/stop", "application/json", bytes.NewBuffer(nil))
+		if err != nil {
+			t.Fatalf("stop recording %d: %v", i, err)
+		}
+		resp.Body.Close()
 	}
 }

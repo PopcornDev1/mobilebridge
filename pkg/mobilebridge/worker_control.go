@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,8 @@ import (
 
 type workerAttachedSession interface {
 	BrowserURL() string
+	StartRecording(context.Context, string) error
+	StopRecording(context.Context) error
 	Close() error
 	Done() <-chan struct{}
 }
@@ -29,6 +33,7 @@ type WorkerControlServer struct {
 	mu            sync.Mutex
 	httpSrv       *http.Server
 	sessions      map[string]*workerControlSession
+	recordings    map[string]*workerControlRecording
 	startAttached func(context.Context, string, string) (workerAttachedSession, error)
 	listDevices   func(context.Context) ([]Device, error)
 	enrichDevice  func(context.Context, *Device) error
@@ -43,9 +48,16 @@ type WorkerControlServer struct {
 }
 
 type workerControlSession struct {
-	id       string
-	deviceID string
-	session  workerAttachedSession
+	id          string
+	deviceID    string
+	session     workerAttachedSession
+	recordingID string
+}
+
+type workerControlRecording struct {
+	id        string
+	sessionID string
+	path      string
 }
 
 type WorkerAttachRequest struct {
@@ -69,6 +81,13 @@ type WorkerCreateTargetResponse struct {
 	Type                 string `json:"type,omitempty"`
 	DevtoolsFrontendURL  string `json:"devtoolsFrontendUrl,omitempty"`
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl,omitempty"`
+}
+
+type WorkerRecordingResponse struct {
+	RecordingID string `json:"recording_id"`
+	FileName    string `json:"file_name,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	SizeBytes   int64  `json:"size_bytes,omitempty"`
 }
 
 type WorkerHeartbeatDevice struct {
@@ -100,6 +119,7 @@ func NewWorkerControlServer(addr string) *WorkerControlServer {
 	return &WorkerControlServer{
 		addr:        addr,
 		sessions:    make(map[string]*workerControlSession),
+		recordings:  make(map[string]*workerControlRecording),
 		listDevices: ListDevices,
 		enrichDevice: func(ctx context.Context, device *Device) error {
 			return device.Enrich(ctx)
@@ -139,6 +159,7 @@ func (s *WorkerControlServer) Start() error {
 	})
 	mux.HandleFunc("/sessions", s.handleSessions)
 	mux.HandleFunc("/sessions/", s.handleSession)
+	mux.HandleFunc("/recordings/", s.handleRecording)
 
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -162,8 +183,12 @@ func (s *WorkerControlServer) Stop() error {
 	s.mu.Lock()
 	srv := s.httpSrv
 	sessions := make([]*workerControlSession, 0, len(s.sessions))
+	recordings := make([]*workerControlRecording, 0, len(s.recordings))
 	for _, session := range s.sessions {
 		sessions = append(sessions, session)
+	}
+	for _, recording := range s.recordings {
+		recordings = append(recordings, recording)
 	}
 	s.mu.Unlock()
 
@@ -171,6 +196,11 @@ func (s *WorkerControlServer) Stop() error {
 	for _, session := range sessions {
 		if closeErr := session.session.Close(); closeErr != nil && err == nil {
 			err = closeErr
+		}
+	}
+	for _, recording := range recordings {
+		if removeErr := os.Remove(recording.path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && err == nil {
+			err = removeErr
 		}
 	}
 	if srv == nil {
@@ -260,6 +290,26 @@ func (s *WorkerControlServer) handleSession(w http.ResponseWriter, r *http.Reque
 		s.handleCreateTarget(w, r, sessionID)
 		return
 	}
+	if strings.HasSuffix(path, "/recording/start") {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		sessionID := strings.TrimSuffix(path, "/recording/start")
+		sessionID = strings.TrimSuffix(sessionID, "/")
+		s.handleStartRecording(w, r, sessionID)
+		return
+	}
+	if strings.HasSuffix(path, "/recording/stop") {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		sessionID := strings.TrimSuffix(path, "/recording/stop")
+		sessionID = strings.TrimSuffix(sessionID, "/")
+		s.handleStopRecording(w, r, sessionID)
+		return
+	}
 	if strings.Contains(path, "/") {
 		http.NotFound(w, r)
 		return
@@ -283,6 +333,7 @@ func (s *WorkerControlServer) handleDeleteSession(w http.ResponseWriter, r *http
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	_ = s.cleanupSessionRecordings(sessionID)
 	s.recordRequest(nil)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
 }
@@ -316,6 +367,125 @@ func (s *WorkerControlServer) handleCreateTarget(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, target)
 }
 
+func (s *WorkerControlServer) handleStartRecording(w http.ResponseWriter, r *http.Request, sessionID string) {
+	entry := s.getSession(sessionID)
+	if entry == nil {
+		s.recordRequest(errors.New("session not found"))
+		http.NotFound(w, r)
+		return
+	}
+	if entry.recordingID != "" {
+		recording := s.getRecording(entry.recordingID)
+		if recording != nil {
+			s.recordRequest(nil)
+			writeJSON(w, http.StatusOK, WorkerRecordingResponse{
+				RecordingID: recording.id,
+				FileName:    filepath.Base(recording.path),
+				ContentType: "video/mp4",
+			})
+			return
+		}
+		s.mu.Lock()
+		entry.recordingID = ""
+		s.mu.Unlock()
+	}
+	file, err := os.CreateTemp("", "mobilebridge-worker-recording-*.mp4")
+	if err != nil {
+		s.recordRequest(err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	outputPath := file.Name()
+	_ = file.Close()
+	_ = os.Remove(outputPath)
+	if err := entry.session.StartRecording(r.Context(), outputPath); err != nil {
+		s.recordRequest(err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	recording := &workerControlRecording{
+		id:        "mbr_" + randomSuffix(4),
+		sessionID: sessionID,
+		path:      outputPath,
+	}
+	s.mu.Lock()
+	entry.recordingID = recording.id
+	s.recordings[recording.id] = recording
+	s.mu.Unlock()
+	s.recordRequest(nil)
+	writeJSON(w, http.StatusOK, WorkerRecordingResponse{
+		RecordingID: recording.id,
+		FileName:    filepath.Base(outputPath),
+		ContentType: "video/mp4",
+	})
+}
+
+func (s *WorkerControlServer) handleStopRecording(w http.ResponseWriter, r *http.Request, sessionID string) {
+	entry := s.getSession(sessionID)
+	if entry == nil {
+		s.recordRequest(errors.New("session not found"))
+		http.NotFound(w, r)
+		return
+	}
+	recording := s.getRecording(entry.recordingID)
+	if recording == nil {
+		s.recordRequest(errors.New("recording not found"))
+		http.NotFound(w, r)
+		return
+	}
+	if err := entry.session.StopRecording(r.Context()); err != nil {
+		s.recordRequest(err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	info, err := os.Stat(recording.path)
+	if err != nil {
+		s.recordRequest(err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	s.mu.Lock()
+	if current := s.sessions[sessionID]; current == entry {
+		current.recordingID = ""
+	}
+	s.mu.Unlock()
+	s.recordRequest(nil)
+	writeJSON(w, http.StatusOK, WorkerRecordingResponse{
+		RecordingID: recording.id,
+		FileName:    filepath.Base(recording.path),
+		ContentType: "video/mp4",
+		SizeBytes:   info.Size(),
+	})
+}
+
+func (s *WorkerControlServer) handleRecording(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/recordings/")
+	if !strings.HasSuffix(path, "/content") {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.authorized(r) {
+		s.recordRequest(errors.New("unauthorized worker control request"))
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	recordingID := strings.TrimSuffix(path, "/content")
+	recordingID = strings.TrimSuffix(recordingID, "/")
+	recording := s.getRecording(recordingID)
+	if recording == nil {
+		s.recordRequest(errors.New("recording not found"))
+		http.NotFound(w, r)
+		return
+	}
+	s.recordRequest(nil)
+	w.Header().Set("Content-Type", "video/mp4")
+	http.ServeFile(w, r, recording.path)
+}
+
 func (s *WorkerControlServer) watchSession(entry *workerControlSession) {
 	<-entry.session.Done()
 	s.mu.Lock()
@@ -338,6 +508,45 @@ func (s *WorkerControlServer) popSession(id string) *workerControlSession {
 	entry := s.sessions[id]
 	delete(s.sessions, id)
 	return entry
+}
+
+func (s *WorkerControlServer) getRecording(id string) *workerControlRecording {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recordings[id]
+}
+
+func (s *WorkerControlServer) cleanupRecording(id string) error {
+	s.mu.Lock()
+	recording := s.recordings[id]
+	delete(s.recordings, id)
+	s.mu.Unlock()
+	if recording == nil {
+		return nil
+	}
+	if removeErr := os.Remove(recording.path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return removeErr
+	}
+	return nil
+}
+
+func (s *WorkerControlServer) cleanupSessionRecordings(sessionID string) error {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.recordings))
+	for id, recording := range s.recordings {
+		if recording.sessionID == sessionID {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.Unlock()
+
+	var err error
+	for _, id := range ids {
+		if cleanupErr := s.cleanupRecording(id); cleanupErr != nil && err == nil {
+			err = cleanupErr
+		}
+	}
+	return err
 }
 
 func (s *WorkerControlServer) Snapshot(ctx context.Context, workerID, hostname, advertiseAddr string) WorkerHeartbeat {

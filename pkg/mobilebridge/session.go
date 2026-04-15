@@ -26,6 +26,20 @@ func (a *AttachedServer) BrowserURL() string {
 	return a.Endpoint
 }
 
+func (a *AttachedServer) StartRecording(ctx context.Context, outputPath string) error {
+	if a == nil || a.Proxy == nil {
+		return ErrBusy
+	}
+	return a.Proxy.StartScreenRecording(ctx, outputPath)
+}
+
+func (a *AttachedServer) StopRecording(ctx context.Context) error {
+	if a == nil || a.Proxy == nil {
+		return ErrBusy
+	}
+	return a.Proxy.StopScreenRecording(ctx)
+}
+
 // StartAttachedServer starts a local CDP bridge for serial at addr. The
 // public HTTP server listens on addr while the ADB forward uses a separate
 // ephemeral localhost port.
