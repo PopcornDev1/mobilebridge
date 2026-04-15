@@ -3,6 +3,7 @@ package mobilebridge
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,6 +39,7 @@ type WorkerControlServer struct {
 	requests      int
 	failures      int
 	lastError     string
+	controlToken  string
 }
 
 type workerControlSession struct {
@@ -118,6 +120,12 @@ func (s *WorkerControlServer) SetMaxSessions(value int) {
 	s.maxSessions = value
 }
 
+func (s *WorkerControlServer) SetControlToken(value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.controlToken = strings.TrimSpace(value)
+}
+
 func (s *WorkerControlServer) ListenAddr() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -181,6 +189,11 @@ func (s *WorkerControlServer) handleSessions(w http.ResponseWriter, r *http.Requ
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.authorized(r) {
+		s.recordRequest(errors.New("unauthorized worker control request"))
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
 	var req WorkerAttachRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -230,6 +243,11 @@ func (s *WorkerControlServer) handleSession(w http.ResponseWriter, r *http.Reque
 	path := strings.TrimPrefix(r.URL.Path, "/sessions/")
 	if path == "" {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.authorized(r) {
+		s.recordRequest(errors.New("unauthorized worker control request"))
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
 	if strings.HasSuffix(path, "/targets") {
@@ -425,6 +443,21 @@ func (s *WorkerControlServer) recordRequest(err error) {
 		s.failures++
 		s.lastError = err.Error()
 	}
+}
+
+func (s *WorkerControlServer) authorized(r *http.Request) bool {
+	s.mu.Lock()
+	token := s.controlToken
+	s.mu.Unlock()
+	if token == "" {
+		return true
+	}
+	header := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(header, "Bearer ") {
+		return false
+	}
+	provided := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
 }
 
 func createTargetViaBrowserURL(ctx context.Context, browserURL, targetURL string) (*WorkerCreateTargetResponse, error) {

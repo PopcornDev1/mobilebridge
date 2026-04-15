@@ -166,12 +166,18 @@ When the worker also receives:
 - `--worker-heartbeat-url`
 - `--worker-id`
 - `--worker-token`
+- `--worker-control-token`
 - `--worker-advertise-url`
 
 it can self-register directly with the control plane. The published
 heartbeat includes current device inventory plus worker load fields such
 as `active_sessions`, `queue_depth`, `max_sessions`, `failure_rate`, and
 `last_error`.
+
+When `--worker-control-token` is set, the worker-control mutation routes
+require `Authorization: Bearer ...` from the control plane. That keeps
+attach, release, and target creation off unauthenticated private-network
+surfaces.
 
 ## Failure handling
 

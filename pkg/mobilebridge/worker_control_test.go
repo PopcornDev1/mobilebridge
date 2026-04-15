@@ -175,6 +175,31 @@ func TestWorkerControlServer_EnforcesMaxSessions(t *testing.T) {
 	}
 }
 
+func TestWorkerControlServer_RequiresControlToken(t *testing.T) {
+	server := NewWorkerControlServer("127.0.0.1:0")
+	server.SetControlToken("control-token")
+	server.startAttached = func(context.Context, string, string) (workerAttachedSession, error) {
+		return &fakeWorkerAttachedSession{
+			browserURL: "http://127.0.0.1:9222",
+			done:       make(chan struct{}),
+		}, nil
+	}
+	server.newSessionID = func() string { return "mbw_test" }
+	if err := server.Start(); err != nil {
+		t.Fatalf("start worker control: %v", err)
+	}
+	defer server.Stop()
+
+	resp, err := http.Post("http://"+server.ListenAddr()+"/sessions", "application/json", bytes.NewBufferString(`{"device_id":"android-1"}`))
+	if err != nil {
+		t.Fatalf("attach session: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
 func TestWorkerControlServer_Snapshot(t *testing.T) {
 	server := NewWorkerControlServer("127.0.0.1:0")
 	server.SetMaxSessions(3)

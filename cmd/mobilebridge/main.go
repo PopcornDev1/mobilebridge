@@ -40,6 +40,7 @@ func main() {
 		workerHeartbeatURL = flag.String("worker-heartbeat-url", "", "POST heartbeat payloads to this vulpine-api /v1/mobile/workers/heartbeat endpoint")
 		workerID           = flag.String("worker-id", "", "stable worker id for hosted worker-control mode")
 		workerToken        = flag.String("worker-token", "", "bearer token for hosted worker heartbeat requests")
+		workerControlToken = flag.String("worker-control-token", "", "bearer token required for hosted worker-control attach, release, and target requests")
 		workerAdvertiseURL = flag.String("worker-advertise-url", "", "public or private URL that vulpine-api should use to reach this worker-control server")
 		workerHostname     = flag.String("worker-hostname", "", "override hostname reported in worker heartbeats")
 		workerInterval     = flag.Duration("worker-heartbeat-interval", 15*time.Second, "interval between hosted worker heartbeats")
@@ -73,6 +74,7 @@ func main() {
 			heartbeatURL: *workerHeartbeatURL,
 			workerID:     *workerID,
 			workerToken:  *workerToken,
+			controlToken: *workerControlToken,
 			advertiseURL: *workerAdvertiseURL,
 			hostname:     *workerHostname,
 			interval:     *workerInterval,
@@ -162,6 +164,7 @@ type workerControlOptions struct {
 	heartbeatURL string
 	workerID     string
 	workerToken  string
+	controlToken string
 	advertiseURL string
 	hostname     string
 	interval     time.Duration
@@ -171,6 +174,7 @@ type workerControlOptions struct {
 func runWorkerControl(addr string, opts workerControlOptions) error {
 	server := mobilebridge.NewWorkerControlServer(addr)
 	server.SetMaxSessions(opts.maxSessions)
+	server.SetControlToken(opts.controlToken)
 	if err := server.Start(); err != nil {
 		return err
 	}
