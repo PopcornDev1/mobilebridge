@@ -411,7 +411,7 @@ Chrome open on any tab, then run the CLI against it end-to-end:
 
 ```
 mobilebridge --list                                  # confirms adb sees the device
-mobilebridge --serial <SERIAL> --port 9222 &          # starts the bridge
+mobilebridge --device <SERIAL> --port 9222 &          # starts the bridge
 curl http://127.0.0.1:9222/json/version | jq .Browser # expect "Chrome/..."
 ```
 
